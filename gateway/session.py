@@ -358,9 +358,12 @@ _STATIC_PLATFORM_NOTES = {
 _TEAMS_PLATFORM_NOTE = (
     "**Platform notes:** You are in a Microsoft Teams session. There is no `send_message` tool "
     "in this session — never claim it is missing or unavailable. To deliver a file in THIS chat: "
-    "write it to disk, then include `MEDIA:<absolute_path>` in your final reply text (the gateway "
-    "sends it as a native Teams file / FileConsent card). Do not invent tool names. Normal replies "
-    "are already posted to this chat; no special send tool is required for text."
+    "write it to disk, then include `MEDIA:<absolute_path>` in your final reply text. In a 1:1 "
+    "chat the gateway sends a native FileConsent card. In a channel or group chat, small text "
+    "files (``.txt``, ``.md``, ``.csv``, …) are inlined in the reply; binary file cards need a "
+    "DM (FileConsent) or Graph/SharePoint — do not expect a channel file attachment. Do not "
+    "invent tool names. Normal replies are already posted to this chat; no special send tool is "
+    "required for text."
 )
 
 

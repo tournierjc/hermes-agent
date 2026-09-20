@@ -1186,17 +1186,73 @@ class TestTeamsMediaAttachments:
         assert pending["bytes"].startswith(b"%PDF")
 
     @pytest.mark.asyncio
-    async def test_send_document_channel_falls_back_to_attachment(self, tmp_path):
+    async def test_send_document_channel_inlines_small_text(self, tmp_path):
         adapter = self._make_adapter()
         adapter._conv_refs["19:abc@thread.v2"] = SimpleNamespace(
             conversation=SimpleNamespace(conversation_type="channel"))
-        doc = tmp_path / "notes.txt"
-        doc.write_text("hello")
-        result = await adapter.send_document("19:abc@thread.v2", str(doc), file_name="notes.txt")
+        doc = tmp_path / "chess_rules.txt"
+        doc.write_text("1. e4 e5")
+        result = await adapter.send_document(
+            "19:abc@thread.v2", str(doc), file_name="chess_rules.txt")
         assert result.success
         assert adapter._pending_uploads == {}
-        adapter._app.activity_sender.send.assert_awaited_once()
-        adapter._app.send.assert_not_awaited()
+        adapter._app.send.assert_awaited()
+        sent = adapter._app.send.await_args.args[1]
+        assert "chess_rules.txt" in sent
+        assert "1. e4 e5" in sent
+        adapter._app.activity_sender.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_document_group_inlines_small_text(self, tmp_path):
+        adapter = self._make_adapter()
+        adapter._conv_refs["19:abc@thread.v2"] = SimpleNamespace(
+            conversation=SimpleNamespace(conversation_type="groupChat"))
+        doc = tmp_path / "notes.md"
+        doc.write_text("# hello")
+        result = await adapter.send_document("19:abc@thread.v2", str(doc), file_name="notes.md")
+        assert result.success
+        sent = adapter._app.send.await_args.args[1]
+        assert "notes.md" in sent
+        assert "# hello" in sent
+
+    @pytest.mark.asyncio
+    async def test_send_document_channel_binary_returns_clear_error(self, tmp_path):
+        adapter = self._make_adapter()
+        adapter._conv_refs["19:abc@thread.v2"] = SimpleNamespace(
+            conversation=SimpleNamespace(conversation_type="channel"))
+        doc = tmp_path / "report.pdf"
+        doc.write_bytes(b"%PDF-1.4 binary")
+        result = await adapter.send_document("19:abc@thread.v2", str(doc), file_name="report.pdf")
+        assert not result.success
+        assert "400" not in (result.error or "")
+        assert "FileConsent" in result.error
+        assert "DM" in result.error or "1:1" in result.error
+        adapter._app.activity_sender.send.assert_not_awaited()
+        adapter._app.send.assert_awaited()
+        assert "report.pdf" in adapter._app.send.await_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_send_document_channel_oversize_text_is_not_inlined(self, tmp_path):
+        adapter = self._make_adapter()
+        adapter._conv_refs["19:abc@thread.v2"] = SimpleNamespace(
+            conversation=SimpleNamespace(conversation_type="channel"))
+        doc = tmp_path / "huge.txt"
+        doc.write_text("x" * (_teams_mod._INLINE_CHANNEL_TEXT_MAX_BYTES + 1))
+        result = await adapter.send_document("19:abc@thread.v2", str(doc), file_name="huge.txt")
+        assert not result.success
+        assert "FileConsent" in result.error
+
+    def test_inlineable_channel_document_helpers(self, tmp_path):
+        f = _teams_mod._is_inlineable_channel_document
+        assert f("/tmp/a.txt")
+        assert f("/tmp/a.bin", "notes.md")
+        assert not f("/tmp/a.pdf")
+        text_path = tmp_path / "ok.txt"
+        text_path.write_text("pawn to e4")
+        assert _teams_mod._read_inline_channel_text(str(text_path)) == "pawn to e4"
+        bin_path = tmp_path / "x.bin"
+        bin_path.write_bytes(b"\x00\x01")
+        assert _teams_mod._read_inline_channel_text(str(bin_path)) is None
 
 
 

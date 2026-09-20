@@ -90,6 +90,21 @@ _CONTENT_TYPE_FILE_CONSENT = "application/vnd.microsoft.teams.card.file.consent"
 _CONTENT_TYPE_FILE_INFO = "application/vnd.microsoft.teams.card.file.info"
 _MAX_FILE_SEND_BYTES = 20 * 1024 * 1024
 _PENDING_UPLOAD_MAX = 32
+# Channel/group chats reject Bot Framework document attachments (400). Small text
+# files are inlined; anything else needs FileConsent (DM) or Graph/SharePoint.
+_INLINE_CHANNEL_TEXT_MAX_BYTES = 48 * 1024
+_INLINE_CHANNEL_TEXT_EXTS = frozenset({
+    ".txt", ".md", ".markdown", ".rst", ".csv", ".tsv",
+    ".json", ".jsonl", ".log",
+    ".yaml", ".yml", ".toml", ".ini",
+    ".py", ".rs", ".js", ".ts", ".tsx", ".jsx",
+    ".go", ".rb", ".sh",
+})
+_CHANNEL_FILE_UNSUPPORTED = (
+    "Can't attach this file in a Teams channel or group chat. FileConsent cards "
+    "work only in a 1:1 chat with the bot; binary channel files need Graph/SharePoint. "
+    "Send the file in a DM, or share it from SharePoint."
+)
 # OneDrive upload session hosts for file-consent PUT (exact suffix; blocks lookalikes).
 _ONEDRIVE_UPLOAD_HOSTS = frozenset({
     "sharepoint.com", "onedrive.com", "1drv.com", "office.com", "office365.com",
@@ -224,6 +239,42 @@ def _consent_card_activity_id(activity: Any) -> Optional[str]:
     if not text or not _TEAMS_CONV_ID_RE.match(text):
         return None
     return text
+
+
+def _is_inlineable_channel_document(path: str, file_name: Optional[str] = None) -> bool:
+    """True when a channel/group send can inline the file as a text message."""
+    import mimetypes
+    name = (file_name or os.path.basename(path) or "").lower()
+    if os.path.splitext(name)[1] in _INLINE_CHANNEL_TEXT_EXTS:
+        return True
+    mime, _ = mimetypes.guess_type(name or path)
+    return bool(mime and mime.split(";", 1)[0].strip().startswith("text/"))
+
+
+def _read_inline_channel_text(path: str, *, max_bytes: int = _INLINE_CHANNEL_TEXT_MAX_BYTES) -> Optional[str]:
+    """UTF-8 text at or under ``max_bytes``, else None (binary / too large / unreadable)."""
+    try:
+        if os.path.getsize(path) > max_bytes:
+            return None
+        with open(path, "rb") as fh:
+            data = fh.read(max_bytes + 1)
+    except OSError:
+        return None
+    if len(data) > max_bytes or b"\x00" in data:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _fence_channel_text(text: str, *, language: str = "") -> str:
+    """Wrap ``text`` in a markdown fence that cannot collide with its contents."""
+    fence = "```"
+    while fence in text:
+        fence += "`"
+    info = language if language and all(ch.isalnum() or ch in "-_+" for ch in language) else ""
+    return f"{fence}{info}\n{text}\n{fence}"
 
 
 class _AiohttpBridgeAdapter:
@@ -911,20 +962,38 @@ class TeamsAdapter(BasePlatformAdapter):
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
                             reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
-        """Send a file. Local paths in personal chats use Teams file-consent (user taps Accept);
-        channel/group chats and remote URLs use a Bot Framework attachment (consent APIs are
-        personal-scope only)."""
+        """Send a file. Personal chats use FileConsent; channel/group local files are
+        inlined when they are small text, otherwise a clear error (Bot Framework
+        document attachments 400 in channels). Remote URLs stay attachments."""
         if file_path.startswith(("http://", "https://")):
             return await self._send_media_attachment(
                 chat_id, file_path, "application/octet-stream", caption=caption,
                 media_label="document", file_name=file_name)
         conv_type = self._conversation_type(chat_id)
         if conv_type and conv_type != "personal":
-            return await self._send_media_attachment(
-                chat_id, file_path, "application/octet-stream", caption=caption,
-                media_label="document", file_name=file_name)
+            return await self._send_channel_document(
+                chat_id, file_path, caption=caption, file_name=file_name)
         return await self._send_file_consent(
             chat_id, file_path, caption=caption, file_name=file_name)
+
+    async def _send_channel_document(
+        self, chat_id: str, file_path: str, *, caption: Optional[str] = None, file_name: Optional[str] = None,
+    ) -> SendResult:
+        """Channel/group file send: inline small text, never base64 document attachments."""
+        path = file_path.removeprefix("file://")
+        name = file_name or os.path.basename(path) or "file"
+        if _is_inlineable_channel_document(path, name):
+            text = _read_inline_channel_text(path)
+            if text is not None:
+                language = os.path.splitext(name)[1].lstrip(".").lower()
+                body = f"**{name}**\n\n{_fence_channel_text(text, language=language)}"
+                if caption:
+                    body = f"{caption}\n\n{body}"
+                return await self.send(chat_id, body)
+        note = f"`{name}` — {_CHANNEL_FILE_UNSUPPORTED}"
+        with suppress(Exception):
+            await self.send(chat_id, note)
+        return SendResult(success=False, error=note)
 
     def _conversation_type(self, chat_id: str) -> Optional[str]:
         """Cached conversation_type for ``chat_id``, or ``None`` when unseen this process."""

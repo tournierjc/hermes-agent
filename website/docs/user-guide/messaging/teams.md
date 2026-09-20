@@ -203,7 +203,7 @@ To receive files in personal chats, the app manifest must set `"supportsFiles": 
 Outbound files:
 
 - **Personal chats** — the bot sends a native **file consent card**. The user taps Accept, Hermes uploads the bytes to that user's OneDrive, then posts a file-info card. This is the Bot Framework-supported send path (no extra Graph permissions).
-- **Channel / group chats** — file-consent APIs are personal-scope only. Hermes falls back to a Bot Framework attachment (filename + content). Clients may preview it rather than treating it as a OneDrive file.
+- **Channel / group chats** — FileConsent is personal-scope only, and Bot Framework document attachments return 400. Small text files (``.txt``, ``.md``, ``.csv``, … under ~48 KB) are inlined as a normal message. Binary files get a clear error pointing at a 1:1 DM (FileConsent) or Graph/SharePoint — not a raw 400.
 - **Images / video / audio** — sent as Bot Framework attachments (data URI for local files, URL for remote). Images already worked this way.
 
 Size cap for consent uploads is 20 MB.

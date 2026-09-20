@@ -281,6 +281,8 @@ class TestBuildSessionContextPrompt:
         assert "never claim it is missing" in prompt
         assert "MEDIA:<absolute_path>" in prompt
         assert "FileConsent" in prompt
+        assert "inlined" in prompt
+        assert "channel" in prompt.lower()
         assert "no special send tool is required for text" in prompt
 
 
