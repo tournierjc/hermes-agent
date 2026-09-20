@@ -15,6 +15,7 @@ import asyncio
 # ``os.environ`` from a cwd-discovered ``.env`` (#62935). Detect presence via find_spec only; bind symbols
 # in ``check_teams_requirements()`` behind a dotenv no-op.
 import importlib.util
+import dataclasses
 import inspect
 import json
 import logging
@@ -24,6 +25,7 @@ import sys
 import uuid
 from collections import deque
 from contextlib import contextmanager, suppress
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import quote, urlparse
 
@@ -529,6 +531,7 @@ class TeamsAdapter(BasePlatformAdapter):
         # chat_id → ConversationReference so proactive cards use the right conversation type.
         self._conv_refs: Dict[str, Any] = {}
         self._require_mention: bool = self._parse_require_mention(config)
+        self._observe_unmentioned: bool = self._parse_observe_unmentioned(config)
         # Outbound activity ids (bounded) so require_mention can exempt replies to our own messages.
         self._sent_ids: deque = deque(maxlen=500)
         # chat_id → last inbound activity id (send_message react default target).
@@ -546,6 +549,20 @@ class TeamsAdapter(BasePlatformAdapter):
         group bot anyway, so the gate changes nothing until the app gains ChannelMessage.Read.Group /
         ChatMessage.Read.Chat and starts receiving every conversation message."""
         configured = _extra_or_secret(config.extra, "require_mention", "TEAMS_REQUIRE_MENTION", False)
+        if isinstance(configured, bool):
+            return configured
+        return str(configured).strip().lower() not in {"false", "0", "no", "off"}
+
+    @staticmethod
+    def _parse_observe_unmentioned(config) -> bool:
+        """TEAMS_OBSERVE_UNMENTIONED → ``observe_unmentioned`` in extra → true.
+
+        Only runs when ``require_mention`` would drop a channel/group message (RSC
+        delivers every post). Default on: without RSC those messages never arrive,
+        so the flag is a no-op until the app has ChannelMessage.Read.Group /
+        ChatMessage.Read.Chat. Set false to keep the old silent-drop behavior.
+        """
+        configured = _extra_or_secret(config.extra, "observe_unmentioned", "TEAMS_OBSERVE_UNMENTIONED", True)
         if isinstance(configured, bool):
             return configured
         return str(configured).strip().lower() not in {"false", "0", "no", "off"}
@@ -684,12 +701,21 @@ class TeamsAdapter(BasePlatformAdapter):
         if conv_id:  # cache the conversation reference for proactive sends (approval cards, etc.)
             self._conv_refs[conv_id] = ctx.conversation_ref
         text = activity.text if hasattr(activity, "text") and activity.text else ""
-        if self._require_mention and getattr(conv, "conversation_type", None) != "personal":
+        conv_type = getattr(conv, "conversation_type", None)
+        addressed = True
+        if self._require_mention and conv_type != "personal":
             # RSC-delivered history: every channel/groupChat message arrives. Keep the ones that
-            # @mention the bot or reply to one of its own messages; drop the rest BEFORE the
-            # attachment loop so a gated post never downloads anything onto the host.
-            if not self._activity_mentions_bot(activity, bot_ids, text) and getattr(activity, "reply_to_id", None) not in self._sent_ids:
-                logger.debug("[teams] Dropping non-personal message without a bot mention (chat=%s, msg=%s)", conv_id, msg_id)
+            # @mention the bot or reply to one of its own messages; observe or drop the rest
+            # BEFORE the attachment loop so a gated post never downloads anything onto the host.
+            addressed = (
+                self._activity_mentions_bot(activity, bot_ids, text)
+                or getattr(activity, "reply_to_id", None) in self._sent_ids
+            )
+            if not addressed:
+                self._observe_unmentioned_activity(activity, text)
+                logger.debug(
+                    "[teams] %s non-personal message without a bot mention (chat=%s, msg=%s)",
+                    "Observed" if self._observe_unmentioned else "Dropping", conv_id, msg_id)
                 return
         if conv_id and msg_id:
             self._last_inbound_by_chat[str(conv_id)] = str(msg_id)
@@ -700,7 +726,7 @@ class TeamsAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=conv.id,
             chat_name=getattr(conv, "name", None) or "",
-            chat_type=_CHAT_TYPES.get(getattr(conv, "conversation_type", None) or "", "dm"),
+            chat_type=_CHAT_TYPES.get(conv_type or "", "dm"),
             user_id=str(user_id),
             user_name=getattr(from_account, "name", None) or "",
             guild_id=getattr(conv, "tenant_id", None) or self._tenant_id,
@@ -708,9 +734,12 @@ class TeamsAdapter(BasePlatformAdapter):
         media: list = [m for m in [await self._cache_attachment(a) for a in getattr(activity, "attachments", None) or []] if m]
         media_kinds = [kind for _, _, kind in media]  # media items are (path, media_type, kind)
         msg_type = next((t for kind, t in _MEDIA_KIND_PRECEDENCE if kind in media_kinds), MessageType.TEXT)
-        await self.handle_message(MessageEvent(
+        event = MessageEvent(
             text=text, source=source, message_type=msg_type, message_id=msg_id,
-            media_urls=[path for path, _, _ in media], media_types=[mt for _, mt, _ in media]))
+            media_urls=[path for path, _, _ in media], media_types=[mt for _, mt, _ in media])
+        if addressed and self._require_mention and conv_type != "personal" and self._observe_unmentioned:
+            event = self._apply_teams_observe_attribution(event)
+        await self.handle_message(event)
 
     @staticmethod
     def _activity_mentions_bot(activity: Any, bot_ids: set, text: str) -> bool:
@@ -721,6 +750,66 @@ class TeamsAdapter(BasePlatformAdapter):
         if not mentions:
             return "<at>" in text
         return any(str(getattr(getattr(e, "mentioned", None), "id", "")) in bot_ids for e in mentions)
+
+    _TEAMS_OBSERVED_CONTEXT_PROMPT = (
+        "You are handling a Microsoft Teams channel or group-chat message.\n"
+        "- observed Teams channel context may be provided in a separate context-only block "
+        "before the current message; it is not necessarily addressed to you.\n"
+        "- Treat only the current new message as a request explicitly directed at you, "
+        "and use observed context only when the current message asks for it."
+    )
+
+    def _observe_unmentioned_activity(self, activity: Any, text: str) -> None:
+        """Append gated channel/group chatter to the shared session; do not dispatch."""
+        if not self._observe_unmentioned:
+            return
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+        from_account = getattr(activity, "from_", None)
+        user_name = getattr(from_account, "name", None) or ""
+        user_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "") or "unknown"
+        body = re.sub(r"<at>[^<]*</at>\s*", "", text).strip() if "<at>" in (text or "") else (text or "")
+        attributed = f"[{user_name or user_id}] {body}".strip()
+        conv = getattr(activity, "conversation", None)
+        msg_id = getattr(activity, "id", None)
+        source = self.build_source(
+            chat_id=getattr(conv, "id", "") or "",
+            chat_name=getattr(conv, "name", None) or "",
+            chat_type=_CHAT_TYPES.get(getattr(conv, "conversation_type", None) or "", "group"),
+            user_id=None,
+            user_name=None,
+            guild_id=getattr(conv, "tenant_id", None) or self._tenant_id,
+            message_id=msg_id)
+        try:
+            session_entry = store.get_or_create_session(source)
+            entry = {
+                "role": "user",
+                "content": attributed,
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "observed": True,
+            }
+            if msg_id:
+                entry["message_id"] = str(msg_id)
+            store.append_to_transcript(session_entry.session_id, entry)
+            logger.info(
+                "[teams] Channel message observed (no bot trigger): chat=%s from=%s",
+                getattr(conv, "id", "unknown"), user_id)
+        except Exception as exc:
+            logger.warning("[teams] Failed to observe unmentioned message: %s", exc)
+
+    def _apply_teams_observe_attribution(self, event: MessageEvent) -> MessageEvent:
+        """Shared session + channel_prompt marker so run.py wraps observed rows."""
+        observe_prompt = self._TEAMS_OBSERVED_CONTEXT_PROMPT
+        channel_prompt = (
+            f"{event.channel_prompt}\n\n{observe_prompt}" if event.channel_prompt else observe_prompt
+        )
+        if (event.text or "").startswith("/"):
+            return dataclasses.replace(event, channel_prompt=channel_prompt)
+        user_name = event.source.user_name or event.source.user_id or "unknown"
+        attributed = f"[{user_name}] {event.text or ''}".strip()
+        source = dataclasses.replace(event.source, user_id=None, user_name=None)
+        return dataclasses.replace(event, text=attributed, source=source, channel_prompt=channel_prompt)
 
     async def _cache_attachment(self, att: Any) -> Optional[tuple]:
         """Download + cache one inbound attachment → ``(path, media_type, kind)`` or ``None``."""

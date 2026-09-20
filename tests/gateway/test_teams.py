@@ -1360,6 +1360,135 @@ class TestTeamsRequireMention:
         assert adapter._extra.get("require_mention") == yaml_value  # extras stay readable on the instance
 
 
+class _FakeTeamsSessionEntry:
+    session_id = "teams-channel-session"
+
+
+class _FakeTeamsSessionStore:
+    def __init__(self):
+        self.sources = []
+        self.messages = []
+
+    def get_or_create_session(self, source):
+        self.sources.append(source)
+        return _FakeTeamsSessionEntry()
+
+    def append_to_transcript(self, session_id, message, skip_db=False):
+        self.messages.append((session_id, message, skip_db))
+
+
+class TestTeamsObserveUnmentioned:
+    """RSC + require_mention: unaddressed posts are observed, not dispatched."""
+
+    APP_ID = "bot-id"
+
+    def _make_adapter(self, **extra):
+        adapter = TeamsAdapter(_make_config(
+            client_id=self.APP_ID, client_secret="secret", tenant_id="tenant",
+            require_mention=True, **extra))
+        adapter._app = MagicMock()
+        adapter._app.id = self.APP_ID
+        adapter.handle_message = AsyncMock()
+        adapter._fetch_attachment_bytes = AsyncMock(return_value=b"\x89PNG" + b"\0" * 32)
+        adapter._session_store = _FakeTeamsSessionStore()
+        return adapter
+
+    def _activity(self, *, text="side chatter", mentioned_id=None, reply_to_id=None):
+        activity = MagicMock()
+        activity.text = text
+        activity.id = "act-obs-1"
+        from_account = MagicMock()
+        from_account.aad_object_id = "aad-456"
+        from_account.name = "Alice"
+        from_account.id = "29:user-123"
+        activity.from_ = from_account
+        activity.recipient = MagicMock()
+        activity.recipient.id = f"28:{self.APP_ID}"
+        activity.conversation = MagicMock(conversation_type="channel", tenant_id="t")
+        activity.conversation.id = "19:conv@thread.v2"
+        activity.conversation.name = "Conv"
+        att = MagicMock(content_type="image/png")
+        att.name = "a.png"
+        att.content_url = "https://smba.trafficmanager.net/emea/v3/attachments/1/views/original"
+        activity.attachments = [att]
+        activity.reply_to_id = reply_to_id
+        activity.entities = []
+        if mentioned_id:
+            entity = MagicMock(type="mention")
+            entity.mentioned = MagicMock()
+            entity.mentioned.id = mentioned_id
+            activity.entities = [entity]
+        return activity
+
+    @pytest.mark.anyio
+    async def test_unmentioned_is_observed_not_dispatched(self):
+        adapter = self._make_adapter()
+        ctx = MagicMock()
+        ctx.activity = self._activity()
+        await adapter._on_message(ctx)
+        adapter.handle_message.assert_not_awaited()
+        adapter._fetch_attachment_bytes.assert_not_awaited()
+        store = adapter._session_store
+        assert len(store.messages) == 1
+        session_id, message, _skip = store.messages[0]
+        assert session_id == "teams-channel-session"
+        assert message["role"] == "user"
+        assert message["content"] == "[Alice] side chatter"
+        assert message["observed"] is True
+        assert message["message_id"] == "act-obs-1"
+        assert store.sources[0].user_id is None
+        assert store.sources[0].chat_id == "19:conv@thread.v2"
+
+    @pytest.mark.anyio
+    async def test_observe_off_drops_without_transcript(self):
+        adapter = self._make_adapter(observe_unmentioned=False)
+        ctx = MagicMock()
+        ctx.activity = self._activity()
+        await adapter._on_message(ctx)
+        adapter.handle_message.assert_not_awaited()
+        adapter._fetch_attachment_bytes.assert_not_awaited()
+        assert adapter._session_store.messages == []
+
+    @pytest.mark.anyio
+    async def test_mention_dispatches_with_observed_context_marker(self):
+        adapter = self._make_adapter()
+        ctx = MagicMock()
+        ctx.activity = self._activity(
+            text="<at>Hermes</at> what did Alice say?", mentioned_id="28:bot-id")
+        await adapter._on_message(ctx)
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args[0][0]
+        assert "observed Teams channel context" in (event.channel_prompt or "")
+        assert event.source.user_id is None
+        assert "[Alice]" in event.text
+        assert "what did Alice say?" in event.text
+        assert adapter._session_store.messages == []
+
+    def test_run_wraps_teams_observed_context_and_keeps_telegram_marker(self):
+        from gateway.run import (
+            _build_gateway_agent_history,
+            _uses_telegram_observed_group_context,
+            _wrap_current_message_with_observed_context,
+        )
+        history = [
+            {"role": "user", "content": "[Alice] side chatter", "observed": True},
+            {"role": "user", "content": "[Bob] what did Alice say?"},
+        ]
+        teams_prompt = "observed Teams channel context may be provided"
+        telegram_prompt = "observed Telegram group context may be provided"
+        assert _uses_telegram_observed_group_context(teams_prompt)
+        assert _uses_telegram_observed_group_context(telegram_prompt)
+        replay, observed = _build_gateway_agent_history(history, channel_prompt=teams_prompt)
+        assert observed == "[Alice] side chatter"
+        assert [row["content"] for row in replay] == ["[Bob] what did Alice say?"]
+        wrapped = _wrap_current_message_with_observed_context("answer me", observed)
+        assert "[Alice] side chatter" in wrapped
+        assert "Current addressed message" in wrapped
+        replay_tg, observed_tg = _build_gateway_agent_history(
+            history, channel_prompt=telegram_prompt)
+        assert observed_tg == observed
+
+
 # ---------------------------------------------------------------------------
 # Tests: reactions + file consent
 # ---------------------------------------------------------------------------

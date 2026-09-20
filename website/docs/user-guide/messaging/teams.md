@@ -22,7 +22,9 @@ Need meeting summaries from Microsoft Graph events rather than normal bot conver
 
 Teams delivers @mentions as regular messages with `<at>BotName</at>` tags, which Hermes strips automatically before processing.
 
-Without resource-specific consent (RSC) Teams only delivers messages that @mention the bot, so no filtering is needed. Once the app manifest grants `ChannelMessage.Read.Group` or `ChatMessage.Read.Chat`, Teams delivers **every** message in the conversation — set `require_mention: true` (or `TEAMS_REQUIRE_MENTION=true`) so the bot only answers channel/group-chat messages that @mention it or reply to one of its own messages. Personal chats are never gated, and a gated message is dropped before its attachments are downloaded.
+Without resource-specific consent (RSC) Teams only delivers messages that @mention the bot, so non-@ chatter never reaches Hermes. Once the app manifest grants `ChannelMessage.Read.Group` or `ChatMessage.Read.Chat`, Teams delivers **every** message — set `require_mention: true` (or `TEAMS_REQUIRE_MENTION=true`) so the bot only **answers** channel/group-chat messages that @mention it or reply to one of its own messages.
+
+With `require_mention` on, `observe_unmentioned` (default **true**, or `TEAMS_OBSERVE_UNMENTIONED`) stores the other posts as `observed` transcript rows — Telegram-style channel context — and still does **not** run the agent or download attachments. Set `observe_unmentioned: false` / `TEAMS_OBSERVE_UNMENTIONED=false` to keep the old silent drop. Personal chats are never gated. Observe only helps after RSC sideload; without those permissions Teams never POSTs unmentioned messages.
 
 ---
 
@@ -170,7 +172,8 @@ Open the printed link in your browser — it opens directly in the Teams client.
 | `TEAMS_HOME_CHANNEL` | Conversation ID for cron/proactive message delivery |
 | `TEAMS_HOME_CHANNEL_NAME` | Display name for the home channel |
 | `TEAMS_PORT` | Webhook port (default: `3978`) |
-| `TEAMS_REQUIRE_MENTION` | Set `true` to answer only @mentions / replies to the bot in channels and group chats (default: `false`; for apps with RSC message-read consent) |
+| `TEAMS_REQUIRE_MENTION` | Set `true` to answer only @mentions / replies to the bot in channels and group chats (default: `false`; required once the app has RSC message-read consent) |
+| `TEAMS_OBSERVE_UNMENTIONED` | When `require_mention` is on, store un-@mentioned channel/group posts as observed context (default: `true`). No-op without RSC. Set `false` to drop them. |
 | `TEAMS_REACTIONS` | Set `false` to disable processing-status emoji reactions (👀 while working, ✅/❌ on complete). Default: enabled. Agent `send_message` react/unreact is always available. |
 
 ### config.yaml
@@ -187,6 +190,7 @@ platforms:
       tenant_id: "your-tenant-id"
       port: 3978
       reactions: true        # processing-status 👀/✅/❌; send_message react is always on
+      observe_unmentioned: true  # RSC + require_mention: store non-@ chatter as context
     require_mention: false   # true once the app has RSC message-read consent
 ```
 
@@ -199,6 +203,18 @@ platforms:
 Inbound file attachments (PDFs, Office docs, and other non-image files) are downloaded and cached locally so the agent can read them — the same path Slack/Discord use. Teams delivers these as `file.download.info` attachments (SharePoint `downloadUrl`) or as a Bot Framework `contentUrl`. **Gated messages are dropped before any attachment is downloaded** (see [How the Bot Responds](#how-the-bot-responds)).
 
 To receive files in personal chats, the app manifest must set `"supportsFiles": true` under `bots`. Recreate or update the app if the Teams client silently ignores file drops onto the bot.
+
+To receive **every** channel/group message (needed for `observe_unmentioned`), add RSC to the sideload manifest and reinstall:
+
+```json
+"webApplicationInfo": {"id": "<botId>", "resource": "https://Api.botframework.com"},
+"authorization": {"permissions": {"resourceSpecific": [
+  {"name": "ChannelMessage.Read.Group", "type": "Application"},
+  {"name": "ChatMessage.Read.Chat", "type": "Application"}
+]}}
+```
+
+A full sideload skeleton lives at `plugins/platforms/teams/manifest.template.json`.
 
 Outbound files:
 
