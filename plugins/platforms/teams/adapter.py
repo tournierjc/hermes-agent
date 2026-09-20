@@ -199,6 +199,21 @@ def _invoke_field(value: Any, *names: str) -> Any:
     return None
 
 
+def _normalize_consent_action(raw: Any) -> str:
+    """Normalize FileConsent action to accept/decline.
+
+    Prefer Enum.value; on Python 3.11 str(Action.ACCEPT) is 'Action.ACCEPT'.
+    """
+    if raw is None:
+        return ""
+    if hasattr(raw, "value"):
+        raw = raw.value
+    text = str(raw).strip().lower()
+    if text.startswith("action."):
+        text = text.split(".", 1)[-1]
+    return text
+
+
 class _AiohttpBridgeAdapter:
     """HttpServerAdapter bridging SDK route registrations into our aiohttp app; without it
     ``App()`` unconditionally imports fastapi/uvicorn and allocates a ``FastAPI()``."""
@@ -965,7 +980,8 @@ class TeamsAdapter(BasePlatformAdapter):
         """Handle ``fileConsent/invoke`` accept/decline from a FileConsentCard."""
         activity = ctx.activity
         value = getattr(activity, "value", None)
-        action = str(_invoke_field(value, "action") or "").lower()
+        action = _normalize_consent_action(_invoke_field(value, "action"))
+        logger.info("[teams] file consent invoke action=%s", action or "(empty)")
         context = _invoke_field(value, "context") or {}
         file_id = _invoke_field(context, "file_id", "fileId") if context is not None else None
         denied = self._card_action_denied(getattr(activity, "from_", None))

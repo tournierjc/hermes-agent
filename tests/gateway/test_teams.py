@@ -3,6 +3,7 @@
 import json
 import sys
 import types
+from enum import Enum
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1335,6 +1336,25 @@ class TestTeamsReactionMapping:
         assert not f("https://sharepoint.com.evil.example/upload")
         assert not f("https://example.com/upload")
 
+    def test_normalize_consent_action_handles_sdk_enum_and_strings(self):
+        # Mirrors microsoft_teams.api.models.action.Action (str, Enum).
+        # On Python 3.11, str(Action.ACCEPT) is 'Action.ACCEPT', not 'accept'.
+        class Action(str, Enum):
+            ACCEPT = "accept"
+            DECLINE = "decline"
+
+        f = _teams_mod._normalize_consent_action
+        # 3.11: str(Action.ACCEPT) == 'Action.ACCEPT'; other versions may stringify to 'accept'.
+        assert str(Action.ACCEPT).lower() in {"action.accept", "accept"}
+        assert Action.ACCEPT.value == "accept"
+        assert f(Action.ACCEPT) == "accept"
+        assert f(Action.DECLINE) == "decline"
+        assert f("Action.ACCEPT") == "accept"
+        assert f("accept") == "accept"
+        assert f("DECLINE") == "decline"
+        assert f(None) == ""
+        assert f("action.accept") == "accept"
+
 
 class TestTeamsReactions:
     def _make_adapter(self):
@@ -1493,6 +1513,35 @@ class TestTeamsFileConsent:
         adapter._pending_uploads["fid-1"] = {"name": "report.pdf", "bytes": b"%PDF"}
         with patch("tools.url_safety.is_safe_url", lambda url: True):
             await adapter._on_file_consent(self._ctx(action="accept"))
+        adapter._upload_consented_file.assert_awaited_once()
+        adapter._send_file_info_card.assert_awaited_once()
+        assert "fid-1" not in adapter._pending_uploads
+
+    @pytest.mark.anyio
+    async def test_accept_sdk_enum_uploads_and_clears_pending(self, monkeypatch):
+        """FileConsent invoke types action as Action (str, Enum); str() is not 'accept'."""
+        class Action(str, Enum):
+            ACCEPT = "accept"
+            DECLINE = "decline"
+
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = self._make_adapter()
+        adapter._pending_uploads["fid-1"] = {"name": "report.pdf", "bytes": b"%PDF"}
+        ctx = self._ctx(action="accept")
+        # SDK models expose attributes, not only dict keys.
+        ctx.activity.value = SimpleNamespace(
+            action=Action.ACCEPT,
+            context=SimpleNamespace(file_id="fid-1"),
+            uploadInfo={
+                "uploadUrl": "https://contoso.sharepoint.com/upload",
+                "name": "report.pdf",
+                "uniqueId": "uid",
+                "fileType": "pdf",
+                "contentUrl": "https://contoso.sharepoint.com/file",
+            },
+        )
+        with patch("tools.url_safety.is_safe_url", lambda url: True):
+            await adapter._on_file_consent(ctx)
         adapter._upload_consented_file.assert_awaited_once()
         adapter._send_file_info_card.assert_awaited_once()
         assert "fid-1" not in adapter._pending_uploads
