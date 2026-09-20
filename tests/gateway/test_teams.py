@@ -1157,6 +1157,7 @@ class TestTeamsMediaAttachments:
         adapter._app = MagicMock()
         adapter._app.id = "bot-id"
         adapter._app.send = AsyncMock(return_value=MagicMock(id="msg-001"))
+        adapter._app.activity_sender.send = AsyncMock(return_value=MagicMock(id="msg-001"))
         return adapter
 
 
@@ -1193,7 +1194,8 @@ class TestTeamsMediaAttachments:
         result = await adapter.send_document("19:abc@thread.v2", str(doc), file_name="notes.txt")
         assert result.success
         assert adapter._pending_uploads == {}
-        adapter._app.send.assert_awaited_once()
+        adapter._app.activity_sender.send.assert_awaited_once()
+        adapter._app.send.assert_not_awaited()
 
 
 
@@ -1489,7 +1491,8 @@ class TestTeamsFileConsent:
         monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
         adapter = self._make_adapter()
         adapter._pending_uploads["fid-1"] = {"name": "report.pdf", "bytes": b"%PDF"}
-        await adapter._on_file_consent(self._ctx(action="accept"))
+        with patch("tools.url_safety.is_safe_url", lambda url: True):
+            await adapter._on_file_consent(self._ctx(action="accept"))
         adapter._upload_consented_file.assert_awaited_once()
         adapter._send_file_info_card.assert_awaited_once()
         assert "fid-1" not in adapter._pending_uploads
