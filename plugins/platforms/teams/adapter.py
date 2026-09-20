@@ -15,6 +15,7 @@ import asyncio
 # ``os.environ`` from a cwd-discovered ``.env`` (#62935). Detect presence via find_spec only; bind symbols
 # in ``check_teams_requirements()`` behind a dotenv no-op.
 import importlib.util
+import inspect
 import json
 import logging
 import os
@@ -211,6 +212,17 @@ def _normalize_consent_action(raw: Any) -> str:
     text = str(raw).strip().lower()
     if text.startswith("action."):
         text = text.split(".", 1)[-1]
+    return text
+
+
+def _consent_card_activity_id(activity: Any) -> Optional[str]:
+    """FileConsent invoke ``replyToId`` / ``reply_to_id`` is the message that holds the card."""
+    raw = _invoke_field(activity, "reply_to_id", "replyToId")
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text or not _TEAMS_CONV_ID_RE.match(text):
+        return None
     return text
 
 
@@ -984,17 +996,20 @@ class TeamsAdapter(BasePlatformAdapter):
         logger.info("[teams] file consent invoke action=%s", action or "(empty)")
         context = _invoke_field(value, "context") or {}
         file_id = _invoke_field(context, "file_id", "fileId") if context is not None else None
+        chat_id = getattr(getattr(activity, "conversation", None), "id", None)
+        card_id = _consent_card_activity_id(activity)
         denied = self._card_action_denied(getattr(activity, "from_", None))
         if denied:
             logger.warning("[teams] file consent rejected: %s", denied)
+            await self._dismiss_consent_card(chat_id, card_id)
             return
-        chat_id = getattr(getattr(activity, "conversation", None), "id", None)
         if action == "decline":
             if file_id:
                 self._pending_uploads.pop(str(file_id), None)
             if chat_id:
                 with suppress(Exception):
                     await self.send(str(chat_id), "File upload declined.")
+            await self._dismiss_consent_card(chat_id, card_id)
             return
         if action != "accept":
             return
@@ -1012,6 +1027,7 @@ class TeamsAdapter(BasePlatformAdapter):
             if chat_id:
                 with suppress(Exception):
                     await self.send(str(chat_id), "That file is no longer available to upload.")
+            await self._dismiss_consent_card(chat_id, card_id)
             return
         try:
             await self._upload_consented_file(str(upload_url), pending["bytes"])
@@ -1021,6 +1037,49 @@ class TeamsAdapter(BasePlatformAdapter):
             if chat_id:
                 with suppress(Exception):
                     await self.send(str(chat_id), "File upload failed.")
+            await self._dismiss_consent_card(chat_id, card_id)
+            return
+        await self._dismiss_consent_card(chat_id, card_id)
+
+    async def _dismiss_consent_card(self, chat_id: Optional[str], activity_id: Optional[str]) -> None:
+        """Delete the FileConsentCard so Accept/Decline cannot be clicked again.
+
+        Uses ``api.conversations.activities(chat_id).delete`` (same client as the streaming TODO).
+        Failures are logged and never fail the upload path.
+        """
+        if not chat_id or not activity_id:
+            return
+        try:
+            api = getattr(self._app, "api", None) if self._app else None
+            conversations = getattr(api, "conversations", None) if api is not None else None
+            activities_fn = getattr(conversations, "activities", None) if conversations is not None else None
+            if callable(activities_fn):
+                ops = activities_fn(str(chat_id))
+                delete_fn = getattr(ops, "delete", None)
+                if callable(delete_fn):
+                    result = delete_fn(str(activity_id))
+                    if inspect.isawaitable(result):
+                        await result
+                    return
+            await self._delete_activity_via_rest(str(chat_id), str(activity_id))
+        except Exception as e:
+            logger.debug("[teams] file consent card dismiss failed: %s", e)
+
+    async def _delete_activity_via_rest(self, chat_id: str, activity_id: str) -> None:
+        """DELETE ``/v3/conversations/{id}/activities/{id}`` (ConversationActivityClient.delete)."""
+        import httpx
+        if not _TEAMS_CONV_ID_RE.match(chat_id) or not _TEAMS_CONV_ID_RE.match(activity_id):
+            raise ValueError("conversation/activity id outside the Bot Framework charset")
+        token = await self._get_botframework_token()
+        service_url = self._service_url_for(chat_id)
+        url = (
+            f"{service_url}v3/conversations/{quote(chat_id, safe=':@-_.')}"
+            f"/activities/{quote(activity_id, safe=':@-_.')}"
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+        async with httpx.AsyncClient(timeout=15.0, trust_env=gateway_trust_env()) as client:
+            response = await client.delete(url, headers=headers)
+            response.raise_for_status()
 
     async def _upload_consented_file(self, upload_url: str, data: bytes) -> None:
         """PUT file bytes into the OneDrive upload session Teams returned on accept."""
@@ -1237,8 +1296,9 @@ class TeamsAdapter(BasePlatformAdapter):
             logger.debug("[teams] gateway_platform_event reaction dispatch failed", exc_info=True)
 
     # TODO(streaming): Teams Bot Framework supports activity updates (``conversations.activities.update``)
-    # which could become progressive edits. Not wired — draft-stream-is-message contract is a
-    # follow-up; do not enable ``draft_stream_is_message`` without that work.
+    # which could become progressive edits. FileConsent dismiss already uses the same client
+    # (``activities.delete``). Streaming itself is not wired — draft-stream-is-message contract
+    # is a follow-up; do not enable ``draft_stream_is_message`` without that work.
 
 
 _SETUP_CREDENTIALS = (

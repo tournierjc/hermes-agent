@@ -1487,10 +1487,20 @@ class TestTeamsFileConsent:
         adapter._send_file_info_card = AsyncMock()
         return adapter
 
-    def _ctx(self, *, action, file_id="fid-1", upload_url="https://contoso.sharepoint.com/upload"):
+    def _wire_dismiss(self, adapter):
+        delete = AsyncMock()
+        ops = MagicMock()
+        ops.delete = delete
+        adapter._app.api.conversations.activities = MagicMock(return_value=ops)
+        return delete
+
+    def _ctx(self, *, action, file_id="fid-1", upload_url="https://contoso.sharepoint.com/upload",
+             reply_to_id=None):
         activity = MagicMock()
         activity.from_ = MagicMock(id="29:user", aad_object_id="aad-1", name="Ada")
         activity.conversation = MagicMock(id="19:abc@thread.v2")
+        activity.reply_to_id = reply_to_id
+        activity.replyToId = reply_to_id
         activity.value = {
             "action": action,
             "context": {"file_id": file_id},
@@ -1575,4 +1585,69 @@ class TestTeamsFileConsent:
         await adapter._on_file_consent(self._ctx(action="accept"))
         adapter._upload_consented_file.assert_not_awaited()
         assert "fid-1" in adapter._pending_uploads
+
+    @pytest.mark.anyio
+    async def test_accept_dismisses_consent_card(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = self._make_adapter()
+        delete = self._wire_dismiss(adapter)
+        adapter._pending_uploads["fid-1"] = {"name": "report.pdf", "bytes": b"%PDF"}
+        with patch("tools.url_safety.is_safe_url", lambda url: True):
+            await adapter._on_file_consent(self._ctx(action="accept", reply_to_id="consent-card-1"))
+        adapter._app.api.conversations.activities.assert_called_once_with("19:abc@thread.v2")
+        delete.assert_awaited_once_with("consent-card-1")
+        adapter._upload_consented_file.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_decline_dismisses_consent_card(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = self._make_adapter()
+        adapter.send = AsyncMock(return_value=MagicMock(success=True))
+        delete = self._wire_dismiss(adapter)
+        adapter._pending_uploads["fid-1"] = {"name": "report.pdf", "bytes": b"%PDF"}
+        await adapter._on_file_consent(self._ctx(action="decline", reply_to_id="consent-card-1"))
+        delete.assert_awaited_once_with("consent-card-1")
+
+    @pytest.mark.anyio
+    async def test_stale_pending_dismisses_consent_card(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = self._make_adapter()
+        adapter.send = AsyncMock(return_value=MagicMock(success=True))
+        delete = self._wire_dismiss(adapter)
+        with patch("tools.url_safety.is_safe_url", lambda url: True):
+            await adapter._on_file_consent(self._ctx(action="accept", reply_to_id="consent-card-1"))
+        adapter._upload_consented_file.assert_not_awaited()
+        delete.assert_awaited_once_with("consent-card-1")
+
+    @pytest.mark.anyio
+    async def test_unauthorized_dismisses_consent_card(self, monkeypatch):
+        monkeypatch.delenv("TEAMS_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("TEAMS_ALLOWED_USERS", "someone-else")
+        adapter = self._make_adapter()
+        delete = self._wire_dismiss(adapter)
+        adapter._pending_uploads["fid-1"] = {"name": "report.pdf", "bytes": b"%PDF"}
+        await adapter._on_file_consent(self._ctx(action="accept", reply_to_id="consent-card-1"))
+        adapter._upload_consented_file.assert_not_awaited()
+        delete.assert_awaited_once_with("consent-card-1")
+
+    @pytest.mark.anyio
+    async def test_dismiss_failure_does_not_fail_upload(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = self._make_adapter()
+        delete = self._wire_dismiss(adapter)
+        delete.side_effect = RuntimeError("connector 404")
+        adapter._pending_uploads["fid-1"] = {"name": "report.pdf", "bytes": b"%PDF"}
+        with patch("tools.url_safety.is_safe_url", lambda url: True):
+            await adapter._on_file_consent(self._ctx(action="accept", reply_to_id="consent-card-1"))
+        adapter._upload_consented_file.assert_awaited_once()
+        adapter._send_file_info_card.assert_awaited_once()
+        assert "fid-1" not in adapter._pending_uploads
+
+    def test_consent_card_activity_id_reads_camel_and_snake(self):
+        f = _teams_mod._consent_card_activity_id
+        assert f(SimpleNamespace(reply_to_id="act-1", replyToId=None)) == "act-1"
+        assert f(SimpleNamespace(replyToId="act-2")) == "act-2"
+        assert f({"replyToId": "act-3"}) == "act-3"
+        assert f(SimpleNamespace(reply_to_id=None, replyToId=None)) is None
+        assert f(SimpleNamespace()) is None
 
