@@ -64,6 +64,14 @@ def _ensure_teams_mock():
             self._card_action_handler = func
             return func
 
+        def on_message_reaction(self, func):
+            self._message_reaction_handler = func
+            return func
+
+        def on_file_consent(self, func):
+            self._file_consent_handler = func
+            return func
+
         async def initialize(self):
             pass
 
@@ -674,6 +682,24 @@ class TestTeamsAttachmentClassification:
         assert event.message_type == MessageType.DOCUMENT
         assert len(event.media_urls) == 2
 
+    @pytest.mark.anyio
+    async def test_direct_url_pdf_sets_document_type(self):
+        from gateway.platforms.event import MessageType
+
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(return_value=b"%PDF-1.4 fake")
+        att = MagicMock()
+        att.content_type = "application/pdf"
+        att.content_url = "https://contoso.sharepoint.com/file.pdf"
+        att.name = "file.pdf"
+        activity = self._make_activity([att])
+        await adapter._on_message(self._make_ctx(activity))
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.DOCUMENT
+        assert event.media_types == ["application/pdf"]
+        adapter._fetch_attachment_bytes.assert_awaited_once_with(
+            "https://contoso.sharepoint.com/file.pdf")
+
 
 # ── Bot Framework connector attachments (pasted images) ──────────────────
 
@@ -1151,6 +1177,23 @@ class TestTeamsMediaAttachments:
         result = await adapter.send_document("19:abc@thread.v2", str(doc))
         assert result.success
         adapter._app.send.assert_awaited_once()
+        # Personal/unknown conversation type uses file-consent, so bytes are staged.
+        assert len(adapter._pending_uploads) == 1
+        pending = next(iter(adapter._pending_uploads.values()))
+        assert pending["name"] == "report.pdf"
+        assert pending["bytes"].startswith(b"%PDF")
+
+    @pytest.mark.asyncio
+    async def test_send_document_channel_falls_back_to_attachment(self, tmp_path):
+        adapter = self._make_adapter()
+        adapter._conv_refs["19:abc@thread.v2"] = SimpleNamespace(
+            conversation=SimpleNamespace(conversation_type="channel"))
+        doc = tmp_path / "notes.txt"
+        doc.write_text("hello")
+        result = await adapter.send_document("19:abc@thread.v2", str(doc), file_name="notes.txt")
+        assert result.success
+        assert adapter._pending_uploads == {}
+        adapter._app.send.assert_awaited_once()
 
 
 
@@ -1221,6 +1264,26 @@ class TestTeamsRequireMention:
         assert adapter.handle_message.await_count == (1 if dispatched else 0)
         assert adapter._fetch_attachment_bytes.await_count == (1 if dispatched else 0)
 
+    @pytest.mark.anyio
+    async def test_gate_drops_file_download_info_before_fetch(self):
+        """File attachments must not be downloaded when require_mention drops the message."""
+        adapter = self._make_adapter(require_mention=True)
+        activity = self._activity("channel")
+        att = MagicMock()
+        att.content_type = "application/vnd.microsoft.teams.file.download.info"
+        att.content_url = None
+        att.name = "secret.pdf"
+        att.content = {
+            "downloadUrl": "https://contoso.sharepoint.com/download/secret",
+            "fileType": "pdf",
+        }
+        activity.attachments = [att]
+        ctx = MagicMock()
+        ctx.activity = activity
+        await adapter._on_message(ctx)
+        adapter.handle_message.assert_not_awaited()
+        adapter._fetch_attachment_bytes.assert_not_awaited()
+
     @pytest.mark.parametrize("yaml_value, env_value, expected", [
         (None, None, False),      # opt-in: absent key leaves every conversation ungated
         (True, None, True),
@@ -1236,3 +1299,228 @@ class TestTeamsRequireMention:
         adapter = self._make_adapter(**extra)
         assert adapter._require_mention is expected
         assert adapter._extra.get("require_mention") == yaml_value  # extras stay readable on the instance
+
+
+# ---------------------------------------------------------------------------
+# Tests: reactions + file consent
+# ---------------------------------------------------------------------------
+
+
+class TestTeamsReactionMapping:
+    def test_unicode_and_alias_map_to_connector_types(self):
+        f = _teams_mod._to_teams_reaction_type
+        assert f("👍") == "like"
+        assert f("heart") == "heart"
+        assert f("👀") == "1f440_eyes"
+        assert f("✅") == "2705_whiteheavycheckmark"
+        assert f("❌") == "angry"
+        assert f("like") == "like"
+        assert f("2705_whiteheavycheckmark") == "2705_whiteheavycheckmark"
+        assert f("") is None
+        assert f("not an emoji !!!") is None
+
+    def test_reaction_type_to_emoji(self):
+        assert _teams_mod._reaction_to_emoji("like") == "👍"
+        assert _teams_mod._reaction_to_emoji("1f440_eyes") == "👀"
+        assert _teams_mod._reaction_to_emoji("custom_id") == "custom_id"
+
+    def test_onedrive_upload_url_allowlist(self):
+        f = _teams_mod._is_allowed_onedrive_upload_url
+        assert f("https://contoso.sharepoint.com/personal/u/upload")
+        assert f("https://my.sharepoint.com:443/upload")
+        assert not f("http://contoso.sharepoint.com/upload")
+        assert not f("https://evilsharepoint.com/upload")
+        assert not f("https://sharepoint.com.evil.example/upload")
+        assert not f("https://example.com/upload")
+
+
+class TestTeamsReactions:
+    def _make_adapter(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+        ))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        adapter._app.api.reactions.add = AsyncMock()
+        adapter._app.api.reactions.delete = AsyncMock()
+        return adapter
+
+    @pytest.mark.anyio
+    async def test_add_reaction_maps_thumbs_up_to_like(self):
+        adapter = self._make_adapter()
+        result = await adapter.add_reaction("19:abc@thread.v2", "👍", message_id="act-1")
+        assert result["success"] is True
+        assert result["reaction"] == "like"
+        adapter._app.api.reactions.add.assert_awaited_once_with(
+            "19:abc@thread.v2", "act-1", "like")
+
+    @pytest.mark.anyio
+    async def test_add_reaction_defaults_to_last_inbound(self):
+        adapter = self._make_adapter()
+        adapter._last_inbound_by_chat["19:abc@thread.v2"] = "last-in"
+        result = await adapter.add_reaction("19:abc@thread.v2", "❤️")
+        assert result["success"] is True
+        assert result["message_id"] == "last-in"
+        adapter._app.api.reactions.add.assert_awaited_once_with(
+            "19:abc@thread.v2", "last-in", "heart")
+
+    @pytest.mark.anyio
+    async def test_add_reaction_without_target_errors(self):
+        adapter = self._make_adapter()
+        result = await adapter.add_reaction("19:abc@thread.v2", "like")
+        assert result["success"] is False
+        assert "message_id" in result["error"]
+        adapter._app.api.reactions.add.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_remove_reaction_uses_last_bot_set_type(self):
+        adapter = self._make_adapter()
+        await adapter.add_reaction("19:abc@thread.v2", "like", message_id="act-1")
+        result = await adapter.remove_reaction("19:abc@thread.v2", message_id="act-1")
+        assert result["success"] is True
+        adapter._app.api.reactions.delete.assert_awaited_once_with(
+            "19:abc@thread.v2", "act-1", "like")
+
+    @pytest.mark.anyio
+    async def test_processing_start_adds_eyes_when_enabled(self):
+        adapter = self._make_adapter()
+        event = MagicMock()
+        event.source.chat_id = "19:abc@thread.v2"
+        event.message_id = "act-1"
+        await adapter.on_processing_start(event)
+        adapter._app.api.reactions.add.assert_awaited_once_with(
+            "19:abc@thread.v2", "act-1", "1f440_eyes")
+
+    @pytest.mark.anyio
+    async def test_processing_start_skipped_when_reactions_disabled(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_REACTIONS", "false")
+        adapter = self._make_adapter()
+        event = MagicMock()
+        event.source.chat_id = "19:abc@thread.v2"
+        event.message_id = "act-1"
+        await adapter.on_processing_start(event)
+        adapter._app.api.reactions.add.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_inbound_reaction_forwards_to_handler(self):
+        adapter = self._make_adapter()
+        adapter._reaction_handler = AsyncMock()
+        activity = MagicMock()
+        activity.from_ = MagicMock(id="29:user", aad_object_id="aad-1", name="Ada")
+        activity.recipient = MagicMock(id="28:bot-id")
+        activity.conversation = MagicMock(
+            id="19:abc@thread.v2", conversation_type="personal",
+            name="Chat", tenant_id="tenant")
+        activity.reply_to_id = "orig-msg"
+        activity.id = "reaction-act"
+        activity.reactions_added = [SimpleNamespace(type="like")]
+        activity.reactions_removed = []
+        ctx = MagicMock()
+        ctx.activity = activity
+        await adapter._on_message_reaction(ctx)
+        adapter._reaction_handler.assert_awaited_once()
+        payload = adapter._reaction_handler.await_args[0][0]
+        assert payload["platform"] == "teams"
+        assert payload["event_name"] == "reaction:added"
+        assert payload["reaction"] == "👍"
+        assert payload["channel_id"] == "19:abc@thread.v2"
+        assert payload["message_ts"] == "orig-msg"
+
+    @pytest.mark.anyio
+    async def test_inbound_self_reaction_is_ignored(self):
+        adapter = self._make_adapter()
+        adapter._reaction_handler = AsyncMock()
+        activity = MagicMock()
+        activity.from_ = MagicMock(id="28:bot-id", aad_object_id=None, name="Hermes")
+        activity.recipient = MagicMock(id="28:bot-id")
+        activity.conversation = MagicMock(id="19:abc@thread.v2", conversation_type="personal")
+        activity.reply_to_id = "orig-msg"
+        activity.reactions_added = [SimpleNamespace(type="like")]
+        activity.reactions_removed = []
+        ctx = MagicMock()
+        ctx.activity = activity
+        await adapter._on_message_reaction(ctx)
+        adapter._reaction_handler.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_react_falls_back_to_rest_when_sdk_client_missing(self):
+        adapter = self._make_adapter()
+        adapter._app.api = None
+        adapter._react_via_rest = AsyncMock()
+        ok = await adapter._add_reaction("19:abc@thread.v2", "act-1", "👍")
+        assert ok is True
+        adapter._react_via_rest.assert_awaited_once_with(
+            "19:abc@thread.v2", "act-1", "like", remove=False)
+
+
+class TestTeamsFileConsent:
+    def _make_adapter(self, monkeypatch=None):
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+        ))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        adapter._app.send = AsyncMock(return_value=MagicMock(id="consent-1"))
+        adapter._upload_consented_file = AsyncMock()
+        adapter._send_file_info_card = AsyncMock()
+        return adapter
+
+    def _ctx(self, *, action, file_id="fid-1", upload_url="https://contoso.sharepoint.com/upload"):
+        activity = MagicMock()
+        activity.from_ = MagicMock(id="29:user", aad_object_id="aad-1", name="Ada")
+        activity.conversation = MagicMock(id="19:abc@thread.v2")
+        activity.value = {
+            "action": action,
+            "context": {"file_id": file_id},
+            "uploadInfo": {
+                "uploadUrl": upload_url,
+                "name": "report.pdf",
+                "uniqueId": "uid",
+                "fileType": "pdf",
+                "contentUrl": "https://contoso.sharepoint.com/file",
+            },
+        }
+        ctx = MagicMock()
+        ctx.activity = activity
+        return ctx
+
+    @pytest.mark.anyio
+    async def test_accept_uploads_and_clears_pending(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = self._make_adapter()
+        adapter._pending_uploads["fid-1"] = {"name": "report.pdf", "bytes": b"%PDF"}
+        await adapter._on_file_consent(self._ctx(action="accept"))
+        adapter._upload_consented_file.assert_awaited_once()
+        adapter._send_file_info_card.assert_awaited_once()
+        assert "fid-1" not in adapter._pending_uploads
+
+    @pytest.mark.anyio
+    async def test_accept_rejects_unsafe_upload_url(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = self._make_adapter()
+        adapter._pending_uploads["fid-1"] = {"name": "report.pdf", "bytes": b"%PDF"}
+        await adapter._on_file_consent(self._ctx(
+            action="accept", upload_url="https://evil.example/steal"))
+        adapter._upload_consented_file.assert_not_awaited()
+        assert "fid-1" in adapter._pending_uploads
+
+    @pytest.mark.anyio
+    async def test_decline_drops_pending(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = self._make_adapter()
+        adapter.send = AsyncMock(return_value=MagicMock(success=True))
+        adapter._pending_uploads["fid-1"] = {"name": "report.pdf", "bytes": b"%PDF"}
+        await adapter._on_file_consent(self._ctx(action="decline"))
+        adapter._upload_consented_file.assert_not_awaited()
+        assert "fid-1" not in adapter._pending_uploads
+
+    @pytest.mark.anyio
+    async def test_unauthorized_click_does_not_upload(self, monkeypatch):
+        monkeypatch.delenv("TEAMS_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("TEAMS_ALLOWED_USERS", "someone-else")
+        adapter = self._make_adapter()
+        adapter._pending_uploads["fid-1"] = {"name": "report.pdf", "bytes": b"%PDF"}
+        await adapter._on_file_consent(self._ctx(action="accept"))
+        adapter._upload_consented_file.assert_not_awaited()
+        assert "fid-1" in adapter._pending_uploads
+

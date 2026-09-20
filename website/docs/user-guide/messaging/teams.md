@@ -171,6 +171,7 @@ Open the printed link in your browser — it opens directly in the Teams client.
 | `TEAMS_HOME_CHANNEL_NAME` | Display name for the home channel |
 | `TEAMS_PORT` | Webhook port (default: `3978`) |
 | `TEAMS_REQUIRE_MENTION` | Set `true` to answer only @mentions / replies to the bot in channels and group chats (default: `false`; for apps with RSC message-read consent) |
+| `TEAMS_REACTIONS` | Set `false` to disable processing-status emoji reactions (👀 while working, ✅/❌ on complete). Default: enabled. Agent `send_message` react/unreact is always available. |
 
 ### config.yaml
 
@@ -185,12 +186,36 @@ platforms:
       client_secret: "your-secret"
       tenant_id: "your-tenant-id"
       port: 3978
+      reactions: true        # processing-status 👀/✅/❌; send_message react is always on
     require_mention: false   # true once the app has RSC message-read consent
 ```
 
 ---
 
 ## Features
+
+### Files
+
+Inbound file attachments (PDFs, Office docs, and other non-image files) are downloaded and cached locally so the agent can read them — the same path Slack/Discord use. Teams delivers these as `file.download.info` attachments (SharePoint `downloadUrl`) or as a Bot Framework `contentUrl`. **Gated messages are dropped before any attachment is downloaded** (see [How the Bot Responds](#how-the-bot-responds)).
+
+To receive files in personal chats, the app manifest must set `"supportsFiles": true` under `bots`. Recreate or update the app if the Teams client silently ignores file drops onto the bot.
+
+Outbound files:
+
+- **Personal chats** — the bot sends a native **file consent card**. The user taps Accept, Hermes uploads the bytes to that user's OneDrive, then posts a file-info card. This is the Bot Framework-supported send path (no extra Graph permissions).
+- **Channel / group chats** — file-consent APIs are personal-scope only. Hermes falls back to a Bot Framework attachment (filename + content). Clients may preview it rather than treating it as a OneDrive file.
+- **Images / video / audio** — sent as Bot Framework attachments (data URI for local files, URL for remote). Images already worked this way.
+
+Size cap for consent uploads is 20 MB.
+
+### Reactions
+
+Teams bots can add and remove emoji reactions through the Bot Framework connector (`PUT/DELETE …/activities/{id}/reactions/{type}`), which the bundled `microsoft-teams-apps` SDK exposes as `api.reactions.add` / `delete`. Hermes uses that for:
+
+- **Processing status** (default on; set `TEAMS_REACTIONS=false` or `extra.reactions: false` to disable): 👀 while the agent works, then ✅ on success or ❌ on failure (mapped to Teams reaction ids `1f440_eyes`, `2705_whiteheavycheckmark`, `angry`).
+- **Agent-facing** `send_message` `action="react"` / `"unreact"`: not gated by `TEAMS_REACTIONS`. Unicode (👍 ❤️ 👀 ✅) and Teams ids (`like`, `heart`, `1f440_eyes`, …) both work.
+
+Inbound `messageReaction` activities are forwarded to gateway reaction hooks (`reaction:added` / `reaction:removed`) so plugins see them. The bot ignores its own reactions.
 
 ### Interactive Approval Cards
 
@@ -202,6 +227,10 @@ When the agent needs to run a potentially dangerous command, it sends an Adaptiv
 - **Deny** — reject the command
 
 Clicking a button resolves the approval inline and replaces the card with the decision.
+
+### Streaming (not yet)
+
+Teams can update an in-flight activity (Bot Framework `conversations.activities.update`), but Hermes does **not** stream replies on Teams yet. Progressive edits would need the gateway's draft-stream contract; that is a follow-up, not part of files/reactions.
 
 ### Meeting Summary Delivery (Teams Meeting Pipeline)
 
@@ -284,6 +313,8 @@ Treat `TEAMS_CLIENT_SECRET` like a password — rotate it periodically via the A
 
 - Store credentials in `~/.hermes/.env` with permissions `600` (`chmod 600 ~/.hermes/.env`)
 - The bot only accepts messages from users in `TEAMS_ALLOWED_USERS`; unauthorized messages are silently dropped
+- File-consent Accept/Decline and approval-card clicks use the same allowlist (or `TEAMS_ALLOW_ALL_USERS`)
+- Gated channel/group-chat messages (`require_mention`) are dropped **before** attachment download
 - Your public endpoint (`/api/messages`) is authenticated by the Teams Bot Framework — requests without valid JWTs are rejected
 
 ## Related Docs
