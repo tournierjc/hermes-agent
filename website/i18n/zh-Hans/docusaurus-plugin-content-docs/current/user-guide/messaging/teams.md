@@ -163,6 +163,16 @@ platforms:
 
 应用清单需设置 `"supportsFiles": true` 才能在个人聊天中收发文件。
 
+### 语音消息
+
+Hermes 在 Teams 上支持**消息语音**——与 Slack 相同的入站 STT + 出站 TTS 路径。这**不是** Discord 语音频道加入/收听（Teams Bot Framework 在 Hermes 中没有对等的实时语音频道 Bot API）。
+
+- **入站：** 语音备忘录和音频附件（包括 `file.download.info` 以及通过 Graph 补回的频道 HTML-only 投递）会下载并缓存为音频，再用已配置的 STT 提供方转录：本地 `faster-whisper`、Groq Whisper（`GROQ_API_KEY`）或 OpenAI Whisper（`VOICE_TOOLS_OPENAI_KEY`）。转录文本交给 Agent。
+- **出站：** TTS 回复作为音频文件附件发送。Hermes 先尝试 Bot Framework `audio/mpeg` 附件。若连接器拒绝 base64 负载（个人私信也会 400），一对一聊天回退为 **FileConsent 接受卡片**（点击接受后文件进入 OneDrive，与文档相同）。频道/群聊则走 Graph `filesFolder` 并发布 SharePoint 链接。
+- **命令：** `/voice on`、`/voice tts`、`/voice off`、`/voice status` 与 Slack/Telegram 相同。`/voice join` / `/voice leave` 是 Discord 语音频道命令，此处不适用。
+
+详见 [Voice Mode](../features/voice-mode.md)。
+
 ### 交互式审批卡片
 
 当 Agent 需要执行可能存在风险的命令时，它会发送一张带有四个按钮的 Adaptive Card，而不是要求你输入 `/approve`：

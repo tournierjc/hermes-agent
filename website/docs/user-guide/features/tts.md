@@ -36,6 +36,8 @@ Convert text to speech with eleven providers:
 |----------|----------|--------|
 | Telegram | Voice bubble (plays inline) | Opus `.ogg` |
 | Discord | Voice bubble (Opus/OGG), falls back to file attachment | Opus/MP3 |
+| Slack | Audio file attachment | MP3 |
+| Microsoft Teams | Audio file attachment (FileConsent in DMs / Graph link in channels if the connector 400s) | MP3 |
 | WhatsApp | Audio file attachment | MP3 |
 | CLI | Saved to `~/.hermes/audio_cache/` | MP3 |
 
@@ -465,7 +467,7 @@ See `agent/tts_provider.py` for the full ABC including docstrings.
 
 ## Voice Message Transcription (STT)
 
-Voice messages sent on Telegram, Discord, WhatsApp, Slack, or Signal are automatically transcribed and injected as text into the conversation. The agent sees the transcript as normal text.
+Voice messages sent on Telegram, Discord, WhatsApp, Slack, Signal, or Microsoft Teams are automatically transcribed and injected as text into the conversation. The agent sees the transcript as normal text.
 
 | Provider | Quality | Cost | API Key |
 |----------|---------|------|---------| 

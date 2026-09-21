@@ -406,6 +406,22 @@ class TestGraphMessageFileRefs:
         assert refs[0]["contentUrl"].endswith("notes.txt")
         assert refs[0]["uniqueId"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
+    def test_extracts_audio_attachments(self):
+        refs = extract_graph_message_file_refs({
+            "attachments": [
+                {"contentType": "text/html", "content": "<p>hi</p>"},
+                {
+                    "contentType": "audio/mp4",
+                    "contentUrl": "https://contoso.sharepoint.com/sites/t/clip.m4a",
+                    "name": "clip.m4a",
+                    "uniqueId": "{bbbbbbbb-cccc-dddd-eeee-ffffffffffff}",
+                },
+            ],
+        })
+        assert len(refs) == 1
+        assert refs[0]["name"] == "clip.m4a"
+        assert refs[0]["contentType"] == "audio/mp4"
+
     def test_message_read_permission_constants(self):
         assert GRAPH_CHANNEL_MESSAGE_PERMISSION == "ChannelMessage.Read.All"
         assert GRAPH_CHANNEL_MESSAGE_RSC == "ChannelMessage.Read.Group"

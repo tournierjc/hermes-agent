@@ -669,6 +669,14 @@ class TestTeamsAttachmentClassification:
         att.name = ""
         return att
 
+    def _audio_attachment(self, name="voice.mp3", content_type="audio/mpeg"):
+        att = MagicMock()
+        att.content_type = content_type
+        att.content_url = "https://smba.example.com/" + name
+        att.name = name
+        att.content = None
+        return att
+
     @pytest.mark.anyio
     async def test_file_download_info_sets_document_type(self):
         from gateway.platforms.event import MessageType
@@ -791,6 +799,152 @@ class TestTeamsAttachmentClassification:
         event = adapter.handle_message.call_args[0][0]
         assert event.message_type == MessageType.DOCUMENT
         assert len(event.media_urls) == 1
+
+    @pytest.mark.anyio
+    async def test_audio_url_sets_voice_type(self):
+        from gateway.platforms.event import MessageType
+
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(return_value=b"ID3fakeaudio")
+        await adapter._on_message(self._make_ctx(
+            self._make_activity([self._audio_attachment()])))
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.VOICE
+        assert len(event.media_urls) == 1
+        assert event.media_types[0].startswith("audio/")
+        adapter._fetch_attachment_bytes.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_camelcase_dict_audio_sets_voice_type(self):
+        from gateway.platforms.event import MessageType
+
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(return_value=b"ID3fakeaudio")
+        att = {
+            "contentType": "audio/mp4",
+            "contentUrl": "https://smba.example.com/voice.m4a",
+            "name": "voice.m4a",
+        }
+        await adapter._on_message(self._make_ctx(self._make_activity([att])))
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.VOICE
+        assert len(event.media_urls) == 1
+        assert event.media_types[0].startswith("audio/")
+
+    @pytest.mark.anyio
+    async def test_file_download_info_audio_sets_voice_type(self):
+        from gateway.platforms.event import MessageType
+
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(return_value=b"ID3fakeaudio")
+        await adapter._on_message(self._make_ctx(
+            self._make_activity([self._file_download_attachment(
+                name="clip.mp3", file_type="mp3")])))
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.VOICE
+        assert len(event.media_urls) == 1
+        assert event.media_types[0].startswith("audio/")
+
+    @pytest.mark.anyio
+    async def test_mislabeled_mp4_voice_clip_sets_voice_type(self):
+        """Teams mobile voice clips often land as video/mp4 named audio_message*."""
+        from gateway.platforms.event import MessageType
+
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(return_value=b"ftypM4A fakeaac")
+        att = {
+            "contentType": "video/mp4",
+            "contentUrl": "https://smba.example.com/audio_message.mp4",
+            "name": "audio_message.mp4",
+        }
+        await adapter._on_message(self._make_ctx(self._make_activity([att])))
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.VOICE
+        assert event.media_types[0].startswith("audio/")
+
+    @pytest.mark.anyio
+    async def test_named_audio_is_not_treated_as_body_mirror(self):
+        from gateway.platforms.event import MessageType
+        from plugins.platforms.teams.graph_files import GraphFileTarget
+
+        download = "https://contoso.sharepoint.com/download/voice"
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(return_value=b"ID3fakeaudio")
+
+        async def get_json(path, **kwargs):
+            if "filesFolder" in path:
+                return {"id": "folder-1", "parentReference": {"driveId": "drive-1"}}
+            return {
+                "id": "item-1",
+                "name": "voice-note.mp3",
+                "@microsoft.graph.downloadUrl": download,
+            }
+
+        graph = MagicMock()
+        graph.get_json = get_json
+        adapter._graph_client = graph
+        conv_id = "19:abc@thread.v2"
+        adapter._graph_file_targets[conv_id] = GraphFileTarget(
+            conversation_type="channel", team_id="team-guid", channel_id=conv_id,
+        )
+        att = {
+            "contentType": "audio/mpeg",
+            "contentUrl": None,
+            "name": "voice-note.mp3",
+        }
+        activity = self._make_activity([att], text="listen to this")
+        activity.conversation.conversation_type = "channel"
+        await adapter._on_message(self._make_ctx(activity))
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.VOICE
+        assert len(event.media_urls) == 1
+        adapter._fetch_attachment_bytes.assert_awaited_once_with(download)
+
+    @pytest.mark.anyio
+    async def test_channel_html_only_fetches_audio_via_graph_message(self):
+        from gateway.platforms.event import MessageType
+        from plugins.platforms.teams.graph_files import GraphFileTarget
+
+        download = "https://contoso.sharepoint.com/download/clip"
+        share_url = "https://contoso.sharepoint.com/sites/team/Shared%20Documents/clip.m4a"
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(return_value=b"ID3fakeaudio")
+        conv_id = "19:abc@thread.v2"
+        adapter._graph_file_targets[conv_id] = GraphFileTarget(
+            conversation_type="channel", team_id="team-guid", channel_id=conv_id,
+        )
+
+        async def get_json(path, **kwargs):
+            if "/messages/" in path:
+                return {
+                    "id": "activity-att-001",
+                    "attachments": [
+                        {
+                            "id": "att-1",
+                            "contentType": "audio/mp4",
+                            "contentUrl": share_url,
+                            "name": "clip.m4a",
+                        },
+                        {"contentType": "text/html", "content": "<p>caption</p>"},
+                    ],
+                }
+            if "/shares/" in path:
+                return {"@microsoft.graph.downloadUrl": download}
+            return {}
+
+        graph = MagicMock()
+        graph.get_json = get_json
+        adapter._graph_client = graph
+        html = self._html_body_attachment()
+        html.content = "<p>listen</p>"
+        activity = self._make_activity([html], text="listen")
+        activity.conversation.conversation_type = "channel"
+        await adapter._on_message(self._make_ctx(activity))
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.VOICE
+        assert len(event.media_urls) == 1
+        assert event.media_types[0].startswith("audio/")
+        adapter._fetch_attachment_bytes.assert_awaited_once_with(download)
 
     @pytest.mark.anyio
     async def test_anonymous_html_body_mirror_is_skipped(self):
@@ -921,6 +1075,42 @@ class TestTeamsAttachmentClassification:
         assert event.text == "are you able to read this"
         assert any("ChannelMessage.Read" in rec.getMessage() for rec in caplog.records)
         adapter._fetch_attachment_bytes.assert_not_awaited()
+
+
+class TestTeamsAudioHeuristics:
+    """Voice clips must reach STT as audio, not video/document body mirrors."""
+
+    def test_audio_mime_is_audio(self):
+        assert _teams_mod._is_teams_audio_attachment("audio/mpeg", "clip.mp3", {})
+
+    def test_named_m4a_is_audio(self):
+        assert _teams_mod._is_teams_audio_attachment("", "note.m4a", {})
+
+    def test_file_type_mp3_is_audio(self):
+        assert _teams_mod._is_teams_audio_attachment(
+            "application/vnd.microsoft.teams.file.download.info",
+            "clip.mp3",
+            {"fileType": "mp3"},
+        )
+
+    def test_voice_clip_mp4_name_is_audio(self):
+        assert _teams_mod._is_teams_audio_attachment("video/mp4", "audio_message.mp4", {})
+
+    def test_unique_type_audio_is_audio(self):
+        assert _teams_mod._is_teams_audio_attachment(
+            "application/vnd.microsoft.teams.file.download.info",
+            "clip.mp4",
+            {"uniqueType": "audio"},
+        )
+
+    def test_plain_video_mp4_is_not_audio(self):
+        assert not _teams_mod._is_teams_audio_attachment("video/mp4", "clip.mp4", {})
+
+    def test_audio_mime_is_not_body_mirror(self):
+        assert not _teams_mod._is_anonymous_body_mirror("audio/mpeg", "", "")
+
+    def test_mp4_voice_clip_caches_as_m4a(self):
+        assert _teams_mod._teams_audio_cache_ext("audio_message.mp4", "video/mp4") == ".m4a"
 
 
 # ── Bot Framework connector attachments (pasted images) ──────────────────
@@ -1393,6 +1583,83 @@ class TestTeamsMediaAttachments:
         result = await adapter.send_voice("19:abc@thread.v2", str(audio), caption="here you go")
         assert result.success
         adapter._app.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_voice_personal_falls_back_to_file_consent(self, tmp_path):
+        from gateway.platforms.base import SendResult
+
+        adapter = self._make_adapter()
+        adapter._conv_refs["a:dmConversation"] = SimpleNamespace(
+            conversation=SimpleNamespace(conversation_type="personal"))
+        audio = tmp_path / "reply.mp3"
+        audio.write_bytes(b"ID3fakeaudio")
+        adapter._send_media_attachment = AsyncMock(
+            return_value=SendResult(success=False, error="400 Bad Request", retryable=True))
+        adapter._send_file_consent = AsyncMock(
+            return_value=SendResult(success=True, message_id="consent-1"))
+        adapter._send_channel_document_via_graph = AsyncMock(
+            side_effect=AssertionError("personal TTS must not use Graph"))
+
+        result = await adapter.send_voice(
+            "a:dmConversation", str(audio), caption="spoken reply")
+
+        assert result.success
+        assert result.message_id == "consent-1"
+        adapter._send_file_consent.assert_awaited_once()
+        call = adapter._send_file_consent.await_args
+        assert call.args[0] == "a:dmConversation"
+        assert call.args[1] == str(audio)
+        assert call.kwargs["caption"] == "spoken reply"
+        assert call.kwargs["file_name"] == "reply.mp3"
+        adapter._send_channel_document_via_graph.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_voice_channel_prefers_attachment(self, tmp_path):
+        adapter = self._make_adapter()
+        adapter._conv_refs["19:chan@thread.tacv2"] = SimpleNamespace(
+            conversation=SimpleNamespace(conversation_type="channel"))
+        audio = tmp_path / "reply.mp3"
+        audio.write_bytes(b"ID3fakeaudio")
+        result = await adapter.send_voice("19:chan@thread.tacv2", str(audio))
+        assert result.success
+        adapter._app.activity_sender.send.assert_awaited_once()
+        adapter._app.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_voice_channel_falls_back_to_graph(self, tmp_path):
+        from plugins.platforms.teams.graph_files import GraphFileTarget, GraphUploadedFile
+
+        adapter = self._make_adapter()
+        adapter._conv_refs["19:chan@thread.tacv2"] = SimpleNamespace(
+            conversation=SimpleNamespace(conversation_type="channel"))
+        adapter._graph_file_targets["19:chan@thread.tacv2"] = GraphFileTarget(
+            conversation_type="channel",
+            team_id="team-guid",
+            channel_id="19:chan@thread.tacv2",
+        )
+        adapter._graph_client = object()
+        adapter._app.activity_sender.send = AsyncMock(side_effect=RuntimeError("400 Bad Request"))
+        audio = tmp_path / "reply.mp3"
+        audio.write_bytes(b"ID3fakeaudio")
+
+        async def _upload(graph, target, *, file_name, data, content_type="application/octet-stream", **_kw):
+            assert file_name == "reply.mp3"
+            assert data.startswith(b"ID3")
+            return GraphUploadedFile(
+                name="reply.mp3",
+                web_url="https://contoso.sharepoint.com/sites/team/reply.mp3",
+                share_url="https://contoso.sharepoint.com/:u:/s/team/audio",
+            )
+
+        with patch("plugins.platforms.teams.graph_files.upload_conversation_file", _upload):
+            result = await adapter.send_voice(
+                "19:chan@thread.tacv2", str(audio), caption="spoken reply")
+
+        assert result.success
+        adapter._app.send.assert_awaited()
+        sent = adapter._app.send.await_args.args[1]
+        assert "spoken reply" in sent
+        assert "https://contoso.sharepoint.com/:u:/s/team/audio" in sent
 
     @pytest.mark.asyncio
     async def test_send_document_local_file_base64(self, tmp_path):

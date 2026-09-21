@@ -33,7 +33,7 @@ A paid [Nous Portal](./tool-gateway.md) subscription supplies the LLM (step 2) *
 | Feature | Platform | Description |
 |---------|----------|-------------|
 | **Interactive Voice** | CLI | Press Ctrl+B to record, agent auto-detects silence and responds |
-| **Auto Voice Reply** | Telegram, Discord | Agent sends spoken audio alongside text responses |
+| **Auto Voice Reply** | Telegram, Discord, Slack, Teams | Agent sends spoken audio alongside text responses |
 | **Voice Channel** | Discord | Bot joins VC, listens to users speaking, speaks replies back |
 
 ## Requirements
@@ -239,11 +239,13 @@ Whisper sometimes generates phantom text from silence or background noise ("Than
 
 ---
 
-## Gateway Voice Reply (Telegram & Discord)
+## Gateway Voice Reply (Telegram, Discord, Slack, Teams)
 
 If you haven't set up your messaging bots yet, see the platform-specific guides:
 - [Telegram Setup Guide](../messaging/telegram.md)
 - [Discord Setup Guide](../messaging/discord.md)
+- [Slack Setup Guide](../messaging/slack.md)
+- [Microsoft Teams Setup Guide](../messaging/teams.md)
 
 Start the gateway to connect to your messaging platforms:
 
@@ -278,7 +280,7 @@ DISCORD_FREE_RESPONSE_CHANNELS=123456789,987654321
 
 ### Commands
 
-These work in both Telegram and Discord (DMs and text channels):
+These work in Telegram, Discord, Slack, and Teams (DMs and text channels):
 
 ```
 /voice          Toggle voice mode on/off
@@ -304,6 +306,8 @@ Voice mode setting is persisted across gateway restarts.
 |----------|--------|-------|
 | **Telegram** | Voice bubble (Opus/OGG) | Plays inline in chat. ffmpeg converts MP3 → Opus if needed |
 | **Discord** | Native voice bubble (Opus/OGG) | Plays inline like a user voice message. Falls back to file attachment if voice bubble API fails |
+| **Slack** | Audio file attachment | MP3/M4A/OGG uploaded as a Slack file |
+| **Microsoft Teams** | Audio file attachment | Bot Framework `audio/mpeg`; personal DMs fall back to a FileConsent Accept card if the connector 400s base64 audio; channel/group falls back to a Graph/SharePoint link |
 
 ---
 

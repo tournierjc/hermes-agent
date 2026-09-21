@@ -230,7 +230,8 @@ Outbound files:
 
 - **Personal chats** — the bot sends a native **file consent card**. The user taps Accept, Hermes uploads the bytes to that user's OneDrive, then posts a file-info card. This is the Bot Framework-supported send path (no extra Graph permissions).
 - **Channel / group chats** — FileConsent is personal-scope only, and Bot Framework document attachments return 400. Small text files (``.txt``, ``.md``, ``.csv``, … under ~48 KB) are inlined as a normal message. Other files are uploaded with **app-only Microsoft Graph** into the team's SharePoint channel folder (or the group chat's files folder), then Hermes posts a clickable sharing/`webUrl` link in the same conversation. Configure Graph as below; if Graph is missing or the upload is denied, the bot posts a clear error (and you can still send the file in a 1:1 DM).
-- **Images / video / audio** — sent as Bot Framework attachments (data URI for local files, URL for remote). Images already worked this way.
+- **Images / video** — sent as Bot Framework attachments (data URI for local files, URL for remote). Images already worked this way.
+- **Voice / TTS audio** — sent as an audio file attachment (Slack-like). Hermes tries a Bot Framework `audio/mpeg` attachment first. If the connector 400s the base64 payload, **personal chats** fall back to a FileConsent Accept card (same as documents); **channel/group chats** fall back to Graph/SharePoint and a link.
 
 Size cap for consent uploads and Graph channel uploads is 20 MB.
 
@@ -255,6 +256,16 @@ MSGRAPH_CLIENT_SECRET=<client-secret-value>
 The first inbound activity in a **channel** stashes `channelData.team.aadGroupId` + channel id so the upload can call `GET /teams/{team-id}/channels/{channel-id}/filesFolder`. The same stash is used when an inbound `file.download.info` attachment omits `downloadUrl`. If the gateway restarted before a file send, set `TEAMS_TEAM_ID` (the Microsoft 365 group GUID) as a fallback. **Group chats** use the Bot Framework conversation id as the Graph chat id (`GET /chats/{id}/filesFolder`) and do not need a team id.
 
 Walkthrough for creating the app registration: [Register a Microsoft Graph application](../../guides/microsoft-graph-app-registration.md#required-for-teams-channelgroup-file-delivery).
+
+### Voice Messages
+
+Hermes supports **messaging** voice on Teams — the same inbound STT + outbound TTS path Slack uses. This is **not** Discord voice-channel join/listen (Teams Bot Framework has no equivalent realtime VC bot API in Hermes).
+
+- **Incoming:** Voice notes and audio attachments (including `file.download.info` clips and channel HTML-only drops recovered via Graph) are downloaded, cached as audio, and transcribed with the configured STT provider: local `faster-whisper`, Groq Whisper (`GROQ_API_KEY`), or OpenAI Whisper (`VOICE_TOOLS_OPENAI_KEY`). The transcript is fed to the agent.
+- **Outgoing:** TTS replies are sent as audio file attachments. Hermes tries a Bot Framework `audio/mpeg` attachment first. If the connector rejects the base64 payload (400 is common in personal DMs as well as channels), a 1:1 chat falls back to a **FileConsent Accept card** (tap Accept to land the file in OneDrive — same as documents). Channel/group chats fall back to the Graph `filesFolder` path and a SharePoint link.
+- **Commands:** `/voice on`, `/voice tts`, `/voice off`, and `/voice status` work the same as on Slack and Telegram. `/voice join` / `/voice leave` are Discord voice-channel commands and do not apply here.
+
+`stt.enabled` / `stt_enabled` (gateway config) must stay on for inbound transcription. See [Voice Mode](../features/voice-mode.md) and [Use Voice Mode with Hermes](../../guides/use-voice-mode-with-hermes.md).
 
 ### Reactions
 
@@ -372,6 +383,7 @@ Make sure the public HTTPS endpoint is reachable from the internet and uses a va
 | Bot receives messages but ignores them | Your AAD object ID may not be in `TEAMS_ALLOWED_USERS`. Run `teams status --verbose` to find it |
 | Tunnel URL changes on restart | devtunnel URLs are persistent if you use a named tunnel (`devtunnel create hermes-bot`). ngrok and cloudflared generate a new URL each run unless you have a paid plan — update the bot endpoint with `teams app update` when it changes |
 | Teams shows "This bot is not responding" | The webhook returned an error. Check `docker logs hermes` / `hermes gateway status -l` for tracebacks |
+| Voice/audio clips are not transcribed | Verify STT is available: install `faster-whisper` for local transcription, or set `GROQ_API_KEY` / `VOICE_TOOLS_OPENAI_KEY` in `~/.hermes/.env`. Channel HTML-only drops also need Graph, same as inbound files |
 | `[teams] Failed to connect` in logs | The SDK failed to authenticate. Double-check your credentials and that the tenant ID matches the account you used in `teams login` |
 
 ---

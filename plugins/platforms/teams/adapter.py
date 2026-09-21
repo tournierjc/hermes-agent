@@ -60,7 +60,8 @@ HttpMethod = str  # type: ignore[assignment,misc]
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
-    gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt, SendResult, cache_image_from_url, cache_media_bytes_async,
+    gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt, SendResult,
+    cache_audio_from_bytes_async, cache_image_from_url, cache_media_bytes_async,
 )
 from gateway.platforms.base_exec_approval import (
     EA_HEADER_TEXT, EA_REASON_LABEL_TEXT, approval_timeout_seconds, format_approval_deadline_line)
@@ -367,8 +368,11 @@ def _is_anonymous_body_mirror(content_type: str, content_url: str, att_name: str
     """Teams mirrors the message body as an unnamed text/html|text/plain with no URL.
 
     A *named* ``text/plain`` (for example ``notes.txt``) is a real file, even
-    when the activity omitted ``contentUrl``.
+    when the activity omitted ``contentUrl``. Audio MIME is never a body
+    mirror — unnamed ``audio/*`` still goes through the STT cache path.
     """
+    if content_type.startswith("audio/"):
+        return False
     if content_type.startswith("application/vnd.microsoft.card"):
         return True
     return content_type in ("text/html", "text/plain") and not content_url and not att_name
@@ -394,6 +398,72 @@ def _attachments_are_html_only(attachments: list) -> bool:
             continue
         return False
     return True
+
+
+# Whisper-family STT + Teams voice-clip containers (MP4/AAC often labeled video/mp4).
+_TEAMS_AUDIO_EXTS = frozenset({
+    ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aac", ".flac", ".mpga", ".oga", ".webm",
+})
+_TEAMS_AUDIO_FILE_TYPES = frozenset(ext.lstrip(".") for ext in _TEAMS_AUDIO_EXTS)
+_TEAMS_VOICE_NAME_PREFIXES = (
+    "audio_message", "audio_clip", "voice_message", "voicemessage", "voice-message",
+)
+_TEAMS_AUDIO_MIME_TO_EXT = {
+    "audio/ogg": ".ogg", "audio/x-opus+ogg": ".ogg", "audio/opus": ".ogg",
+    "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/webm": ".webm",
+    "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/m4a": ".m4a",
+    "audio/aac": ".m4a", "audio/flac": ".flac", "audio/x-flac": ".flac",
+}
+_TEAMS_EXT_TO_AUDIO_MIME = {
+    ".mp4": "audio/mp4", ".m4a": "audio/mp4", ".mp3": "audio/mpeg",
+    ".mpeg": "audio/mpeg", ".mpga": "audio/mpeg", ".wav": "audio/wav",
+    ".webm": "audio/webm", ".ogg": "audio/ogg", ".oga": "audio/ogg",
+    ".opus": "audio/opus", ".aac": "audio/aac", ".flac": "audio/flac",
+}
+_TEAMS_STT_EXTS = _TEAMS_AUDIO_EXTS | {".mp4", ".mpeg"}
+
+
+def _is_teams_voice_clip(filename: str, content_map: Optional[dict] = None) -> bool:
+    """True for Teams voice notes that Slack-style heuristics would send to STT.
+
+    Mobile clips often land as MP4/AAC labeled ``video/mp4`` or ``fileType: mp4``.
+    Real video attachments (no voice-name / uniqueType) are not matched.
+    """
+    name = (filename or "").strip().lower()
+    stem = os.path.splitext(name)[0]
+    if any(stem.startswith(prefix) or name.startswith(prefix) for prefix in _TEAMS_VOICE_NAME_PREFIXES):
+        return True
+    unique_type = _field_text(content_map or {}, "uniqueType", "unique_type").lower()
+    return unique_type in {"audio", "voice"}
+
+
+def _is_teams_audio_attachment(
+    content_type: str, filename: str, content_map: Optional[dict] = None,
+) -> bool:
+    """True when inbound bytes should be cached as audio for gateway STT."""
+    content_map = content_map or {}
+    mime = (content_type or "").split(";", 1)[0].strip().lower()
+    if mime.startswith("audio/"):
+        return True
+    ext = os.path.splitext((filename or "").strip())[1].lower()
+    if ext in _TEAMS_AUDIO_EXTS:
+        return True
+    file_type = _field_text(content_map, "fileType", "file_type").lstrip(".").lower()
+    if file_type in _TEAMS_AUDIO_FILE_TYPES:
+        return True
+    return _is_teams_voice_clip(filename, content_map)
+
+
+def _teams_audio_cache_ext(filename: str, mime_type: str) -> str:
+    """Cache extension matching the container bytes (never ``.ogg`` for MP4/AAC)."""
+    name_ext = os.path.splitext((filename or "").strip())[1].lower()
+    if name_ext == ".mp4":
+        return ".m4a"
+    if name_ext in _TEAMS_STT_EXTS:
+        return name_ext
+    mime_key = (mime_type or "").split(";", 1)[0].strip().lower()
+    return _TEAMS_AUDIO_MIME_TO_EXT.get(mime_key, ".m4a")
 
 
 def _normalize_consent_action(raw: Any) -> str:
@@ -655,11 +725,12 @@ def check_teams_requirements() -> bool:
 
 
 _CHAT_TYPES = {"personal": "dm", "groupChat": "group", "channel": "channel"}
-# DOCUMENT wins over PHOTO/VIDEO/AUDIO for mixed attachments: document-context
+# DOCUMENT wins over PHOTO/VIDEO/VOICE for mixed attachments: document-context
 # injection gates strictly on MessageType.DOCUMENT (same precedence as Email/Signal).
+# Audio maps to VOICE (not AUDIO) so gateway STT transcribes clips like Slack.
 _MEDIA_KIND_PRECEDENCE = (
     ("document", MessageType.DOCUMENT), ("image", MessageType.PHOTO),
-    ("video", MessageType.VIDEO), ("audio", MessageType.AUDIO))
+    ("video", MessageType.VIDEO), ("audio", MessageType.VOICE))
 _APPROVAL_CHOICES = {"approve_once": "once", "approve_session": "session", "approve_always": "always", "deny": "deny"}
 _APPROVAL_LABELS = {
     "once": "✅ Allowed (once)", "session": "✅ Allowed (session)", "always": "✅ Always allowed", "deny": "❌ Denied",
@@ -1017,6 +1088,29 @@ class TeamsAdapter(BasePlatformAdapter):
         source = dataclasses.replace(event.source, user_id=None, user_name=None)
         return dataclasses.replace(event, text=attributed, source=source, channel_prompt=channel_prompt)
 
+    async def _cache_inbound_audio(
+        self, data: bytes, *, filename: str, mime_type: str,
+    ) -> Optional[tuple]:
+        """Cache voice/audio bytes so gateway STT sees ``audio/*`` (not a video/document)."""
+        ext = _teams_audio_cache_ext(filename, mime_type)
+        path = await cache_audio_from_bytes_async(data, ext)
+        mime = (mime_type or "").split(";", 1)[0].strip().lower()
+        if not mime.startswith("audio/"):
+            mime = _TEAMS_EXT_TO_AUDIO_MIME.get(ext, "audio/mpeg")
+        return path, mime, "audio"
+
+    async def _cache_attachment_bytes(
+        self, data: bytes, *, filename: str, mime_type: str,
+        content_map: Optional[dict] = None,
+    ) -> Optional[tuple]:
+        """Classify + cache attachment bytes; audio/voice clips always use the audio cache."""
+        if _is_teams_audio_attachment(mime_type, filename, content_map):
+            return await self._cache_inbound_audio(
+                data, filename=filename, mime_type=mime_type)
+        cached = await cache_media_bytes_async(
+            data, filename=filename, mime_type=mime_type)
+        return (cached.path, cached.media_type, cached.kind) if cached else None
+
     async def _cache_attachment(self, att: Any, *, graph_target: Any = None) -> Optional[tuple]:
         """Download + cache one inbound attachment → ``(path, media_type, kind)`` or ``None``."""
         content_url = _field_text(att, "content_url", "contentUrl")
@@ -1058,13 +1152,14 @@ class TeamsAdapter(BasePlatformAdapter):
             if download_url:
                 try:
                     data = await self._fetch_attachment_bytes(download_url)
-                    cached = await cache_media_bytes_async(data, filename=filename, mime_type="")
+                    cached = await self._cache_attachment_bytes(
+                        data, filename=filename, mime_type="", content_map=content_map)
                     if not cached:
                         logger.warning(
                             "[teams] Unsupported document type for attachment '%s', skipping",
                             filename)
                         return None
-                    return cached.path, cached.media_type, cached.kind
+                    return cached
                 except Exception as e:
                     logger.warning("[teams] Failed to cache file attachment '%s': %s", filename, e)
                     return None
@@ -1072,9 +1167,9 @@ class TeamsAdapter(BasePlatformAdapter):
                 return None
         if not content_url and att_name and isinstance(content, str) and content:
             try:
-                cached = await cache_media_bytes_async(
-                    content.encode("utf-8"), filename=att_name, mime_type=content_type)
-                return (cached.path, cached.media_type, cached.kind) if cached else None
+                return await self._cache_attachment_bytes(
+                    content.encode("utf-8"), filename=att_name, mime_type=content_type,
+                    content_map=content_map)
             except Exception as e:
                 logger.warning(
                     "[teams] Failed to cache inline attachment '%s' (%s): %s",
@@ -1088,9 +1183,9 @@ class TeamsAdapter(BasePlatformAdapter):
             if download_url:
                 try:
                     data = await self._fetch_attachment_bytes(download_url)
-                    cached = await cache_media_bytes_async(
-                        data, filename=filename, mime_type=content_type)
-                    return (cached.path, cached.media_type, cached.kind) if cached else None
+                    return await self._cache_attachment_bytes(
+                        data, filename=filename, mime_type=content_type,
+                        content_map=content_map)
                 except Exception as e:
                     logger.warning("[teams] Failed to cache attachment '%s' (%s): %s", filename, content_type, e)
                     return None
@@ -1120,8 +1215,9 @@ class TeamsAdapter(BasePlatformAdapter):
         if content_url:  # direct-URL non-image attachment (video/audio/document)
             try:
                 data = await self._fetch_attachment_bytes(content_url)
-                cached = await cache_media_bytes_async(data, filename=att_name, mime_type=content_type)
-                return (cached.path, cached.media_type, cached.kind) if cached else None
+                return await self._cache_attachment_bytes(
+                    data, filename=att_name or filename, mime_type=content_type,
+                    content_map=content_map)
             except Exception as e:
                 logger.warning("[teams] Failed to cache attachment '%s' (%s): %s", att_name or content_url, content_type, e)
         return None
@@ -1205,6 +1301,11 @@ class TeamsAdapter(BasePlatformAdapter):
         media: list = []
         for ref in refs:
             filename = ref.get("name") or "document"
+            mime_type = (ref.get("contentType") or "").split(";", 1)[0].strip()
+            if mime_type.lower() in {
+                "reference", "application/vnd.microsoft.teams.file.download.info",
+            }:
+                mime_type = ""
             download_url = await self._resolve_inbound_download_url_via_graph(
                 {"uniqueId": ref.get("uniqueId") or ""},
                 content_url=ref.get("contentUrl") or "",
@@ -1215,9 +1316,10 @@ class TeamsAdapter(BasePlatformAdapter):
                 continue
             try:
                 data = await self._fetch_attachment_bytes(download_url)
-                cached = await cache_media_bytes_async(data, filename=filename, mime_type="")
+                cached = await self._cache_attachment_bytes(
+                    data, filename=filename, mime_type=mime_type)
                 if cached:
-                    media.append((cached.path, cached.media_type, cached.kind))
+                    media.append(cached)
             except Exception as e:
                 logger.warning("[teams] Failed to cache Graph message file '%s': %s", filename, e)
         return media
@@ -1492,7 +1594,30 @@ class TeamsAdapter(BasePlatformAdapter):
 
     async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
                          metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
-        return await self._send_media_attachment(chat_id, audio_path, "audio/mpeg", caption=caption, media_label="voice")
+        """Send TTS/audio as a Bot Framework audio attachment (Slack-like file UX).
+
+        The connector often 400s on base64 ``audio/mpeg`` (personal DMs included).
+        Personal/unknown chats fall back to FileConsent; channel/group chats fall
+        back to Graph filesFolder and a SharePoint link.
+        """
+        result = await self._send_media_attachment(
+            chat_id, audio_path, "audio/mpeg", caption=caption, media_label="voice")
+        if result.success or audio_path.startswith(("http://", "https://")):
+            return result
+        path = audio_path.removeprefix("file://")
+        name = os.path.basename(path) or "voice.mp3"
+        conv_type = self._conversation_type(chat_id)
+        if conv_type and conv_type != "personal":
+            logger.warning(
+                "[teams] Bot Framework voice attachment failed in %s (%s); "
+                "falling back to Graph filesFolder", conv_type, result.error)
+            return await self._send_channel_document_via_graph(
+                chat_id, path, caption=caption, file_name=name)
+        logger.warning(
+            "[teams] Bot Framework voice attachment failed in personal chat (%s); "
+            "falling back to FileConsent", result.error)
+        return await self._send_file_consent(
+            chat_id, path, caption=caption, file_name=name)
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
                             reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
