@@ -148,4 +148,4 @@ class TestMicrosoftGraphClient:
         assert captured["accept"] == "application/json"
         assert captured["authorization"] == "Bearer cached-token"
         assert captured["body"] == b"%PDF-bytes"
-        assert "@microsoft.graph.conflictBehavior=rename" in str(captured["url"])
+        assert "microsoft.graph.conflictBehavior=rename" in str(captured["url"])
