@@ -4,10 +4,10 @@ Outbound: Bot Framework document attachments 400 and FileConsent is personal-sco
 only, so the adapter PUTs into the conversation's ``filesFolder`` drive and posts
 the resulting webUrl / org sharing link.
 
-Inbound: channel ``file.download.info`` activities often omit ``downloadUrl``.
-``resolve_inbound_file_download_url`` looks up the item via filesFolder + uniqueId
-or the Graph shares API (``u!`` encoding of a SharePoint URL) using the same
-app-only credentials.
+Inbound: channel file drops often omit ``file.download.info`` entirely (Bot Framework
+sends only a ``text/html`` body mirror). ``list_graph_message_file_refs`` GETs the
+Graph channel/chat message and ``resolve_inbound_file_download_url`` then fetches
+SharePoint bytes via filesFolder / the shares API using the same app-only credentials.
 """
 
 from __future__ import annotations
@@ -25,8 +25,13 @@ from tools.microsoft_graph_client import MicrosoftGraphAPIError, MicrosoftGraphC
 
 # Simple PUT to ``:/content`` is capped at 4 MiB; larger files use an upload session.
 SIMPLE_UPLOAD_MAX_BYTES = 4 * 1024 * 1024
-# Application permission that covers filesFolder + content PUT + createLink.
+# Application permission that covers filesFolder + content PUT + createLink + inbound download.
 GRAPH_CHANNEL_FILE_PERMISSION = "Files.ReadWrite.All"
+# GET /teams/{id}/channels/{id}/messages/{id} when Bot Framework only sent text/html.
+GRAPH_CHANNEL_MESSAGE_PERMISSION = "ChannelMessage.Read.All"
+GRAPH_CHANNEL_MESSAGE_RSC = "ChannelMessage.Read.Group"
+GRAPH_CHAT_MESSAGE_PERMISSION = "Chat.Read.All"
+GRAPH_CHAT_MESSAGE_RSC = "ChatMessage.Read.Chat"
 _UNSAFE_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
@@ -308,6 +313,60 @@ async def resolve_inbound_file_download_url(
         if url:
             return url
     return ""
+
+
+def graph_message_path(target: GraphFileTarget, message_id: str) -> str:
+    """Graph path for one channel or chat message (inbound HTML-only file fallback)."""
+    mid = _safe_graph_id(message_id, label="message id")
+    if target.team_id and target.channel_id:
+        return (
+            f"/teams/{quote(target.team_id, safe='')}"
+            f"/channels/{quote(target.channel_id, safe='')}"
+            f"/messages/{quote(mid, safe='')}"
+        )
+    if target.chat_id:
+        return f"/chats/{quote(target.chat_id, safe='')}/messages/{quote(mid, safe='')}"
+    raise GraphFileTargetError("Graph message lookup needs team_id+channel_id or chat_id.")
+
+
+def extract_graph_message_file_refs(payload: Any) -> list[dict[str, str]]:
+    """SharePoint file refs from a Graph chatMessage (skip HTML body / cards)."""
+    if not isinstance(payload, dict):
+        return []
+    refs: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for att in payload.get("attachments") or []:
+        name = _as_text(_field(att, "name"))
+        content_url = _as_text(_field(att, "contentUrl", "content_url"))
+        content_type = _as_text(_field(att, "contentType", "content_type")).lower()
+        unique_id = _strip_item_id(_as_text(_field(att, "uniqueId", "unique_id")))
+        if content_type in ("text/html", "text/plain") or content_type.startswith(
+            "application/vnd.microsoft.card"
+        ):
+            continue
+        if content_type in ("messageReference", "forwardedMessageReference"):
+            continue
+        if not name and not content_url:
+            continue
+        key = (name, content_url)
+        if key in seen:
+            continue
+        seen.add(key)
+        refs.append({
+            "name": name,
+            "contentUrl": content_url,
+            "uniqueId": unique_id,
+            "contentType": content_type,
+        })
+    return refs
+
+
+async def list_graph_message_file_refs(
+    graph: Any, target: GraphFileTarget, message_id: str,
+) -> list[dict[str, str]]:
+    """GET the Graph channel/chat message and return downloadable file refs."""
+    payload = await graph.get_json(graph_message_path(target, message_id))
+    return extract_graph_message_file_refs(payload)
 
 
 async def _download_url_via_files_folder(

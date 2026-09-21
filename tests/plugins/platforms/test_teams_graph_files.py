@@ -9,11 +9,16 @@ import pytest
 
 from plugins.platforms.teams.graph_files import (
     GRAPH_CHANNEL_FILE_PERMISSION,
+    GRAPH_CHANNEL_MESSAGE_PERMISSION,
+    GRAPH_CHANNEL_MESSAGE_RSC,
     SIMPLE_UPLOAD_MAX_BYTES,
     GraphFileTarget,
     GraphFileUploadError,
     encode_graph_share_id,
     extract_graph_file_target,
+    extract_graph_message_file_refs,
+    graph_message_path,
+    list_graph_message_file_refs,
     markdown_file_link,
     resolve_graph_credentials,
     resolve_graph_file_target,
@@ -360,3 +365,72 @@ class TestInboundGraphDownloadUrl:
             content_url="https://smba.trafficmanager.net/emea/v3/attachments/1",
         )
         assert url == ""
+
+
+class TestGraphMessageFileRefs:
+    def test_channel_message_path_quotes_ids(self):
+        path = graph_message_path(
+            GraphFileTarget(
+                conversation_type="channel",
+                team_id="team-guid",
+                channel_id="19:chan@thread.tacv2",
+            ),
+            "12345",
+        )
+        assert path.startswith("/teams/team-guid/channels/")
+        assert path.endswith("/messages/12345")
+        assert "@" not in path.split("/channels/")[1].split("/")[0]
+
+    def test_group_chat_message_path(self):
+        path = graph_message_path(
+            GraphFileTarget(conversation_type="groupChat", chat_id="19:chat@thread.v2"),
+            "99",
+        )
+        assert path == "/chats/19%3Achat%40thread.v2/messages/99"
+
+    def test_extracts_reference_attachments_and_skips_html(self):
+        refs = extract_graph_message_file_refs({
+            "attachments": [
+                {"contentType": "text/html", "content": "<p>hi</p>"},
+                {
+                    "contentType": "reference",
+                    "contentUrl": "https://contoso.sharepoint.com/sites/t/notes.txt",
+                    "name": "notes.txt",
+                    "uniqueId": "{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}",
+                },
+                {"contentType": "application/vnd.microsoft.card.adaptive", "name": "card"},
+            ],
+        })
+        assert len(refs) == 1
+        assert refs[0]["name"] == "notes.txt"
+        assert refs[0]["contentUrl"].endswith("notes.txt")
+        assert refs[0]["uniqueId"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    def test_message_read_permission_constants(self):
+        assert GRAPH_CHANNEL_MESSAGE_PERMISSION == "ChannelMessage.Read.All"
+        assert GRAPH_CHANNEL_MESSAGE_RSC == "ChannelMessage.Read.Group"
+        assert GRAPH_CHANNEL_FILE_PERMISSION == "Files.ReadWrite.All"
+
+    @pytest.mark.asyncio
+    async def test_list_graph_message_file_refs_gets_channel_message(self):
+        graph = _FakeGraph()
+
+        async def get_json(path, **kwargs):
+            graph.gets.append(path)
+            return {
+                "attachments": [{
+                    "contentType": "reference",
+                    "contentUrl": "https://contoso.sharepoint.com/sites/t/a.pdf",
+                    "name": "a.pdf",
+                }],
+            }
+
+        graph.get_json = get_json  # type: ignore[method-assign]
+        refs = await list_graph_message_file_refs(
+            graph,
+            GraphFileTarget(
+                conversation_type="channel", team_id="t", channel_id="c"),
+            "msg-1",
+        )
+        assert refs[0]["name"] == "a.pdf"
+        assert graph.gets == ["/teams/t/channels/c/messages/msg-1"]

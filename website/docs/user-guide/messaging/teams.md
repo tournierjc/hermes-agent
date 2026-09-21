@@ -206,9 +206,11 @@ platforms:
 
 Inbound file attachments (PDFs, Office docs, and other non-image files) are downloaded and cached locally so the agent can read them — the same path Slack/Discord use. Teams delivers these as `file.download.info` attachments (SharePoint `downloadUrl`) or as a Bot Framework `contentUrl`. **Gated messages are dropped before any attachment is downloaded** (see [How the Bot Responds](#how-the-bot-responds)).
 
-Named `text/plain` / `text/html` files (for example a `.txt` drop) are treated as real attachments. Only an *anonymous* `text/html` or `text/plain` payload with no URL and no filename is skipped — that is Teams mirroring the message body.
+Channel/group file drops are worse: Bot Framework often sends **only** an unnamed `text/html` body mirror (caption in `activity.text`, no `file.download.info`). That is a Teams limitation, not a Hermes skip. When Graph is configured, Hermes `GET`s the channel or chat message (`/teams/{teamId}/channels/{channelId}/messages/{id}` or `/chats/{chatId}/messages/{id}`) and downloads SharePoint `attachments[].contentUrl` via the same filesFolder/shares path. Personal 1:1 chats still use `file.download.info` / FileConsent and do **not** take this Graph GET.
 
-Channel activities sometimes omit `downloadUrl`. When Graph is configured with the same `MSGRAPH_*` / `TEAMS_*` credentials as outbound SharePoint upload (`Files.ReadWrite.All`), Hermes resolves the file via the channel `filesFolder` + `uniqueId`, or the Graph shares API (`u!` encoding of a SharePoint URL), then downloads the preauthenticated URL. If Graph is not configured and `downloadUrl` is missing, the message text still arrives, a warning is logged, and `media_urls` stays empty — the agent cannot read the file.
+That inbound GET needs **`ChannelMessage.Read.Group`** (RSC — already in `plugins/platforms/teams/manifest.template.json`) or tenant-wide **`ChannelMessage.Read.All`** for channels, and **`ChatMessage.Read.Chat`** (RSC) or **`Chat.Read.All`** for group chats, plus **`Files.ReadWrite.All`** to download. If Graph is missing or GET returns 403, the caption still arrives, a warning names the permission, and `media_urls` stays empty.
+
+Channel activities that *do* include `file.download.info` sometimes omit `downloadUrl`. Hermes then resolves the file via `filesFolder` + `uniqueId`, or the Graph shares API (`u!` encoding of a SharePoint URL).
 
 To receive files in personal chats, the app manifest must set `"supportsFiles": true` under `bots`. Recreate or update the app if the Teams client silently ignores file drops onto the bot.
 
@@ -237,7 +239,7 @@ Size cap for consent uploads and Graph channel uploads is 20 MB.
 Hermes reuses the shared Graph client (`tools/microsoft_graph_client.py`) with **client-credentials** (daemon) auth. Preferred credentials are `MSGRAPH_TENANT_ID` / `MSGRAPH_CLIENT_ID` / `MSGRAPH_CLIENT_SECRET`. If those are unset, the adapter falls back to the Teams bot app (`TEAMS_*`) — that works when it is the **same Entra app** and an admin has consented the Graph application permission below.
 
 1. In [Entra app registrations](https://entra.microsoft.com) open the Graph app (or the Teams bot app, if you are reusing it).
-2. **API permissions → Microsoft Graph → Application permissions** → add **`Files.ReadWrite.All`**.
+2. **API permissions → Microsoft Graph → Application permissions** → add **`Files.ReadWrite.All`**. For inbound channel files when Bot Framework only sends `text/html`, also add **`ChannelMessage.Read.All`** (or rely on RSC `ChannelMessage.Read.Group` from the sideload manifest). Group chats need **`Chat.Read.All`** or RSC `ChatMessage.Read.Chat`.
 3. Click **Grant admin consent for \<tenant\>**. Status must show a green check. Delegated permissions are not used; the gateway has no user sign-in for this path.
 4. Put the credentials in `~/.hermes/.env` (`chmod 600`):
 

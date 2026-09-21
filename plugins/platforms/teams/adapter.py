@@ -305,6 +305,28 @@ def _is_anonymous_body_mirror(content_type: str, content_url: str, att_name: str
     return content_type in ("text/html", "text/plain") and not content_url and not att_name
 
 
+def _attachments_are_html_only(attachments: list) -> bool:
+    """True when every Bot Framework attachment is a body/card mirror.
+
+    Channel/group file drops often look like this: caption in ``activity.text`` plus
+    a single unnamed ``text/html`` attachment — no ``file.download.info``.
+    """
+    if not attachments:
+        return False
+    for att in attachments:
+        content_url = _field_text(att, "content_url", "contentUrl")
+        content_type_raw = _invoke_field(att, "content_type", "contentType")
+        content_type = (
+            content_type_raw.lower().split(";")[0].strip()
+            if isinstance(content_type_raw, str) else ""
+        )
+        att_name = _field_text(att, "name")
+        if _is_anonymous_body_mirror(content_type, content_url, att_name):
+            continue
+        return False
+    return True
+
+
 def _normalize_consent_action(raw: Any) -> str:
     """Normalize FileConsent action to accept/decline.
 
@@ -825,12 +847,20 @@ class TeamsAdapter(BasePlatformAdapter):
             guild_id=getattr(conv, "tenant_id", None) or self._tenant_id,
             message_id=msg_id)
         graph_target = self._graph_file_target_for(str(conv_id)) if conv_id else None
+        raw_atts = _activity_attachments(activity)
         media: list = [
             m for m in [
                 await self._cache_attachment(a, graph_target=graph_target)
-                for a in _activity_attachments(activity)
+                for a in raw_atts
             ] if m
         ]
+        if (
+            not media
+            and graph_target is not None
+            and msg_id
+            and _attachments_are_html_only(raw_atts)
+        ):
+            media = await self._cache_files_from_graph_message(graph_target, str(msg_id))
         media_kinds = [kind for _, _, kind in media]  # media items are (path, media_type, kind)
         msg_type = next((t for kind, t in _MEDIA_KIND_PRECEDENCE if kind in media_kinds), MessageType.TEXT)
         event = MessageEvent(
@@ -1056,6 +1086,64 @@ class TeamsAdapter(BasePlatformAdapter):
                 filename,
             )
         return url or ""
+
+    async def _cache_files_from_graph_message(self, graph_target: Any, message_id: str) -> list:
+        """Channel/group file drop: Bot Framework sent only text/html — GET the Graph message."""
+        from plugins.platforms.teams.graph_files import (
+            GRAPH_CHANNEL_MESSAGE_PERMISSION, GRAPH_CHANNEL_MESSAGE_RSC,
+            GRAPH_CHAT_MESSAGE_PERMISSION, GRAPH_CHAT_MESSAGE_RSC,
+            list_graph_message_file_refs,
+        )
+        from tools.microsoft_graph_client import MicrosoftGraphAPIError
+
+        client = self._graph_client_for_files()
+        if client is None:
+            logger.warning(
+                "[teams] Channel/group activity had only text/html attachments; Graph is not "
+                "configured so the agent cannot read the SharePoint file. Grant %s plus %s "
+                "(RSC) or %s (same MSGRAPH_*/TEAMS_* app as outbound uploads).",
+                "Files.ReadWrite.All", GRAPH_CHANNEL_MESSAGE_RSC, GRAPH_CHANNEL_MESSAGE_PERMISSION,
+            )
+            return []
+        try:
+            refs = await list_graph_message_file_refs(client, graph_target, message_id)
+        except MicrosoftGraphAPIError as e:
+            needed = (
+                f"{GRAPH_CHANNEL_MESSAGE_RSC} (RSC) or {GRAPH_CHANNEL_MESSAGE_PERMISSION}"
+                if getattr(graph_target, "team_id", "")
+                else f"{GRAPH_CHAT_MESSAGE_RSC} (RSC) or {GRAPH_CHAT_MESSAGE_PERMISSION}"
+            )
+            logger.warning(
+                "[teams] Graph GET message %s failed (%s). Inbound channel files need %s "
+                "and Files.ReadWrite.All to download. %s",
+                message_id, getattr(e, "status_code", "?"), needed, e,
+            )
+            return []
+        except Exception as e:
+            logger.warning("[teams] Graph GET message %s failed: %s", message_id, e)
+            return []
+        if not refs:
+            logger.info("[teams] Graph message %s has no file attachments", message_id)
+            return []
+        media: list = []
+        for ref in refs:
+            filename = ref.get("name") or "document"
+            download_url = await self._resolve_inbound_download_url_via_graph(
+                {"uniqueId": ref.get("uniqueId") or ""},
+                content_url=ref.get("contentUrl") or "",
+                filename=filename,
+                graph_target=graph_target,
+            )
+            if not download_url:
+                continue
+            try:
+                data = await self._fetch_attachment_bytes(download_url)
+                cached = await cache_media_bytes_async(data, filename=filename, mime_type="")
+                if cached:
+                    media.append((cached.path, cached.media_type, cached.kind))
+            except Exception as e:
+                logger.warning("[teams] Failed to cache Graph message file '%s': %s", filename, e)
+        return media
 
     async def _send_card(self, chat_id: str, card: "AdaptiveCard") -> "Any":
         """Send an AdaptiveCard, using a stored ConversationReference when available."""

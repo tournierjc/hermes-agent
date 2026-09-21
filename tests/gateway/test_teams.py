@@ -844,6 +844,84 @@ class TestTeamsAttachmentClassification:
         assert len(event.media_urls) == 1
         adapter._fetch_attachment_bytes.assert_awaited_once_with(download)
 
+    @pytest.mark.anyio
+    async def test_channel_html_only_fetches_file_via_graph_message(self):
+        """Channel file drops often arrive as unnamed text/html only — Graph GET message."""
+        from gateway.platforms.event import MessageType
+        from plugins.platforms.teams.graph_files import GraphFileTarget
+
+        download = "https://contoso.sharepoint.com/download/notes"
+        share_url = "https://contoso.sharepoint.com/sites/team/Shared%20Documents/notes.txt"
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(return_value=b"hello from sharepoint")
+        conv_id = "19:abc@thread.v2"
+        adapter._graph_file_targets[conv_id] = GraphFileTarget(
+            conversation_type="channel", team_id="team-guid", channel_id=conv_id,
+        )
+
+        async def get_json(path, **kwargs):
+            if "/messages/" in path:
+                return {
+                    "id": "activity-att-001",
+                    "attachments": [
+                        {
+                            "id": "att-1",
+                            "contentType": "reference",
+                            "contentUrl": share_url,
+                            "name": "notes.txt",
+                        },
+                        {"contentType": "text/html", "content": "<p>caption</p>"},
+                    ],
+                }
+            if "/shares/" in path:
+                return {"@microsoft.graph.downloadUrl": download}
+            return {}
+
+        graph = MagicMock()
+        graph.get_json = get_json
+        adapter._graph_client = graph
+        html = self._html_body_attachment()
+        html.content = "<p>are you able to read this</p>"
+        activity = self._make_activity([html], text="are you able to read this")
+        activity.conversation.conversation_type = "channel"
+        await adapter._on_message(self._make_ctx(activity))
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.DOCUMENT
+        assert len(event.media_urls) == 1
+        assert event.text == "are you able to read this"
+        adapter._fetch_attachment_bytes.assert_awaited_once_with(download)
+
+    @pytest.mark.anyio
+    async def test_channel_html_only_graph_403_keeps_text_and_warns(self, caplog):
+        import logging
+        from plugins.platforms.teams.graph_files import GraphFileTarget
+        from tools.microsoft_graph_client import MicrosoftGraphAPIError
+
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(
+            side_effect=AssertionError("must not fetch after Graph 403"))
+        conv_id = "19:abc@thread.v2"
+        adapter._graph_file_targets[conv_id] = GraphFileTarget(
+            conversation_type="channel", team_id="team-guid", channel_id=conv_id,
+        )
+
+        async def get_json(path, **kwargs):
+            raise MicrosoftGraphAPIError(403, "GET", path, "Access denied")
+
+        graph = MagicMock()
+        graph.get_json = get_json
+        adapter._graph_client = graph
+        activity = self._make_activity(
+            [self._html_body_attachment()], text="are you able to read this")
+        activity.conversation.conversation_type = "channel"
+        with caplog.at_level(logging.WARNING):
+            await adapter._on_message(self._make_ctx(activity))
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_urls == []
+        assert event.text == "are you able to read this"
+        assert any("ChannelMessage.Read" in rec.getMessage() for rec in caplog.records)
+        adapter._fetch_attachment_bytes.assert_not_awaited()
+
 
 # ── Bot Framework connector attachments (pasted images) ──────────────────
 
