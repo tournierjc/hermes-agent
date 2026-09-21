@@ -1,17 +1,23 @@
-"""Upload a local file into a Teams channel/group SharePoint folder via Microsoft Graph.
+"""Microsoft Graph helpers for Teams channel/group SharePoint files.
 
-Channel/group Bot Framework document attachments 400; FileConsent is personal-scope
-only. App-only Graph uploads into the conversation's ``filesFolder`` drive, then the
-adapter posts the resulting webUrl / org sharing link as a normal channel message.
+Outbound: Bot Framework document attachments 400 and FileConsent is personal-scope
+only, so the adapter PUTs into the conversation's ``filesFolder`` drive and posts
+the resulting webUrl / org sharing link.
+
+Inbound: channel ``file.download.info`` activities often omit ``downloadUrl``.
+``resolve_inbound_file_download_url`` looks up the item via filesFolder + uniqueId
+or the Graph shares API (``u!`` encoding of a SharePoint URL) using the same
+app-only credentials.
 """
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from tools.microsoft_graph_auth import GraphCredentials
 from tools.microsoft_graph_client import MicrosoftGraphAPIError, MicrosoftGraphClientError
@@ -228,6 +234,138 @@ def resolve_graph_file_target(
     if kind == "groupChat" and chat_id:
         return GraphFileTarget(conversation_type="groupChat", chat_id=chat_id)
     return None
+
+
+def encode_graph_share_id(sharing_url: str) -> str:
+    """Graph sharing token: ``u!`` + base64url(url) without padding."""
+    raw = base64.urlsafe_b64encode(sharing_url.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"u!{raw}"
+
+
+def graph_item_download_url(item: Any) -> str:
+    """Preauthenticated ``@microsoft.graph.downloadUrl`` from a driveItem payload."""
+    if not isinstance(item, dict):
+        return ""
+    return _as_text(
+        item.get("@microsoft.graph.downloadUrl")
+        or item.get("@microsoft.graph.download_url")
+        or item.get("downloadUrl")
+        or item.get("download_url")
+    )
+
+
+def _looks_like_sharepoint_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme != "https" or parsed.port not in (None, 443):
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in {"sharepoint.com", "onedrive.com", "1drv.com"} or host.endswith(
+        (".sharepoint.com", ".sharepoint-df.com", ".onedrive.com", ".1drv.com")
+    )
+
+
+def _strip_item_id(value: str) -> str:
+    return (value or "").strip().strip("{}")
+
+
+async def resolve_inbound_file_download_url(
+    graph: Any,
+    *,
+    target: GraphFileTarget | None = None,
+    content: dict[str, Any] | None = None,
+    content_url: str = "",
+    filename: str = "",
+) -> str:
+    """Resolve a preauthenticated download URL when the activity omitted ``downloadUrl``.
+
+    Channel ``file.download.info`` attachments often carry ``uniqueId`` / a SharePoint
+    ``contentUrl`` without ``downloadUrl``. Same app-only Graph credentials as outbound
+    filesFolder upload (``Files.ReadWrite.All``).
+    """
+    content = content or {}
+    unique_id = _strip_item_id(_as_text(
+        _field(content, "uniqueId", "unique_id", "itemId", "item_id")
+    ))
+    sharing_url = _as_text(
+        _field(content, "webUrl", "web_url", "fileUrl", "file_url", "contentUrl", "content_url")
+        or content_url
+    )
+    if unique_id and target is not None:
+        url = await _download_url_via_files_folder(
+            graph, target, unique_id=unique_id, filename="")
+        if url:
+            return url
+    if filename and target is not None:
+        url = await _download_url_via_files_folder(
+            graph, target, unique_id="", filename=filename)
+        if url:
+            return url
+    if _looks_like_sharepoint_url(sharing_url):
+        url = await _download_url_via_share(graph, sharing_url)
+        if url:
+            return url
+    return ""
+
+
+async def _download_url_via_files_folder(
+    graph: Any,
+    target: GraphFileTarget,
+    *,
+    unique_id: str,
+    filename: str,
+) -> str:
+    try:
+        folder = await graph.get_json(target.files_folder_path())
+    except (MicrosoftGraphAPIError, MicrosoftGraphClientError):
+        return ""
+    if not isinstance(folder, dict):
+        return ""
+    parent = folder.get("parentReference") if isinstance(folder.get("parentReference"), dict) else {}
+    try:
+        drive_id = _safe_graph_id(str(parent.get("driveId") or "").strip(), label="drive id")
+        folder_id = _safe_graph_id(str(folder.get("id") or "").strip(), label="folder id")
+    except GraphFileUploadError:
+        return ""
+    paths: list[str] = []
+    if unique_id:
+        try:
+            item_id = _safe_graph_id(unique_id, label="item id")
+        except GraphFileUploadError:
+            item_id = ""
+        if item_id:
+            paths.append(f"/drives/{quote(drive_id, safe='')}/items/{quote(item_id, safe='')}")
+    if filename:
+        encoded = quote(safe_graph_filename(filename), safe="._-")
+        paths.append(
+            f"/drives/{quote(drive_id, safe='')}/items/{quote(folder_id, safe='')}:/{encoded}"
+        )
+    for path in paths:
+        try:
+            item = await graph.get_json(path)
+        except (MicrosoftGraphAPIError, MicrosoftGraphClientError):
+            continue
+        url = graph_item_download_url(item)
+        if url:
+            return url
+        web = _as_text((item or {}).get("webUrl") or (item or {}).get("web_url")) if isinstance(item, dict) else ""
+        if _looks_like_sharepoint_url(web):
+            via_share = await _download_url_via_share(graph, web)
+            if via_share:
+                return via_share
+    return ""
+
+
+async def _download_url_via_share(graph: Any, sharing_url: str) -> str:
+    share_id = encode_graph_share_id(sharing_url)
+    path = f"/shares/{quote(share_id, safe='!')}/driveItem"
+    try:
+        item = await graph.get_json(path)
+    except (MicrosoftGraphAPIError, MicrosoftGraphClientError):
+        return ""
+    return graph_item_download_url(item)
 
 
 def _safe_graph_id(value: str, *, label: str) -> str:

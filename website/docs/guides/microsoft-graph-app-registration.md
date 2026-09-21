@@ -87,7 +87,7 @@ The Teams bot cannot attach binary files in channels or group chats (Bot Framewo
 
 | Permission | What it lets the app do |
 |------------|--------------------------|
-| `Files.ReadWrite.All` | Read the channel/chat `filesFolder`, PUT driveItem content (or create an upload session), and create an organization view link. Application permission; **admin consent required**. |
+| `Files.ReadWrite.All` | Read the channel/chat `filesFolder`, PUT driveItem content (or create an upload session), create an organization view link, and resolve inbound channel files that omit `downloadUrl` (`uniqueId` / shares API). Application permission; **admin consent required**. |
 
 `Files.ReadWrite.All` is tenant-wide. There is no narrower application permission that can upload into an arbitrary team's channel folder. Prefer a dedicated Graph app, restrict who can message the bot (`TEAMS_ALLOWED_USERS`), and do not grant this to an app that untrusted users can drive.
 

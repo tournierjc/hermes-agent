@@ -619,6 +619,7 @@ class TestTeamsAttachmentClassification:
         adapter._app = MagicMock()
         adapter._app.id = "bot-id"
         adapter.handle_message = AsyncMock()
+        adapter._graph_client = False
         return adapter
 
     def _make_activity(self, attachments, text="see attached"):
@@ -725,6 +726,123 @@ class TestTeamsAttachmentClassification:
         assert event.media_types == ["application/pdf"]
         adapter._fetch_attachment_bytes.assert_awaited_once_with(
             "https://contoso.sharepoint.com/file.pdf")
+
+    @pytest.mark.anyio
+    async def test_camelcase_dict_file_download_info_sets_document_type(self):
+        """Bot Framework JSON uses contentType/contentUrl; dict attachments must work."""
+        from gateway.platforms.event import MessageType
+
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(return_value=b"%PDF-1.4 fake")
+        att = {
+            "contentType": "application/vnd.microsoft.teams.file.download.info",
+            "contentUrl": None,
+            "name": "report.pdf",
+            "content": {
+                "downloadUrl": "https://contoso.sharepoint.com/download/x",
+                "fileType": "pdf",
+            },
+        }
+        await adapter._on_message(self._make_ctx(self._make_activity([att])))
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.DOCUMENT
+        assert len(event.media_urls) == 1
+        adapter._fetch_attachment_bytes.assert_awaited_once_with(
+            "https://contoso.sharepoint.com/download/x")
+
+    @pytest.mark.anyio
+    async def test_file_download_info_missing_download_url_warns(self, caplog):
+        import logging
+        from gateway.platforms.event import MessageType
+
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(
+            side_effect=AssertionError("must not fetch without a URL"))
+        att = {
+            "contentType": "application/vnd.microsoft.teams.file.download.info",
+            "name": "notes.txt",
+            "content": {
+                "uniqueId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "fileType": "txt",
+            },
+        }
+        with caplog.at_level(logging.WARNING):
+            await adapter._on_message(self._make_ctx(
+                self._make_activity([att], text="are you able to read this")))
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.TEXT
+        assert event.media_urls == []
+        assert event.text == "are you able to read this"
+        assert any("downloadUrl" in rec.getMessage() for rec in caplog.records)
+        adapter._fetch_attachment_bytes.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_named_text_plain_is_not_treated_as_body_mirror(self):
+        from gateway.platforms.event import MessageType
+
+        adapter = self._make_adapter()
+        att = MagicMock()
+        att.content_type = "text/plain"
+        att.content_url = None
+        att.name = "notes.txt"
+        att.content = "hello from the file"
+        await adapter._on_message(self._make_ctx(
+            self._make_activity([att], text="are you able to read this")))
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.DOCUMENT
+        assert len(event.media_urls) == 1
+
+    @pytest.mark.anyio
+    async def test_anonymous_html_body_mirror_is_skipped(self):
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(
+            side_effect=AssertionError("must not fetch body mirror"))
+        await adapter._on_message(self._make_ctx(
+            self._make_activity([self._html_body_attachment()])))
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_urls == []
+        adapter._fetch_attachment_bytes.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_missing_download_url_uses_graph_unique_id(self):
+        from gateway.platforms.event import MessageType
+        from plugins.platforms.teams.graph_files import GraphFileTarget
+
+        download = "https://contoso.sharepoint.com/download/notes"
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(return_value=b"hello file")
+
+        async def get_json(path, **kwargs):
+            if "filesFolder" in path:
+                return {"id": "folder-1", "parentReference": {"driveId": "drive-1"}}
+            return {
+                "id": "item-1",
+                "name": "notes.txt",
+                "@microsoft.graph.downloadUrl": download,
+            }
+
+        graph = MagicMock()
+        graph.get_json = get_json
+        adapter._graph_client = graph
+        conv_id = "19:abc@thread.v2"
+        adapter._graph_file_targets[conv_id] = GraphFileTarget(
+            conversation_type="channel", team_id="team-guid", channel_id=conv_id,
+        )
+        att = {
+            "contentType": "application/vnd.microsoft.teams.file.download.info",
+            "name": "notes.txt",
+            "content": {
+                "uniqueId": "{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}",
+                "fileType": "txt",
+            },
+        }
+        activity = self._make_activity([att], text="are you able to read this")
+        activity.conversation.conversation_type = "channel"
+        await adapter._on_message(self._make_ctx(activity))
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.DOCUMENT
+        assert len(event.media_urls) == 1
+        adapter._fetch_attachment_bytes.assert_awaited_once_with(download)
 
 
 # ── Bot Framework connector attachments (pasted images) ──────────────────

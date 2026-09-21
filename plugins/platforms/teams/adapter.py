@@ -221,18 +221,88 @@ def _is_allowed_onedrive_upload_url(url: str) -> bool:
         return False
 
 
+def _is_mock_object(value: Any) -> bool:
+    """True for unittest.mock stand-ins — never treat auto-attrs as real IDs/URLs."""
+    return type(value).__module__.startswith("unittest.mock")
+
+
 def _invoke_field(value: Any, *names: str) -> Any:
-    """Read a field from an SDK model or a dict (file-consent invoke payloads use both)."""
+    """Read a field from an SDK model or a dict (file-consent / attachments use both).
+
+    Accepts snake_case and camelCase names. Skips ``None``, blank strings, and
+    ``MagicMock`` auto-attributes so a dict payload or a test double cannot
+    shadow a real sibling field.
+    """
     if isinstance(value, dict):
         for name in names:
-            if name in value and value[name] is not None:
-                return value[name]
+            if name not in value:
+                continue
+            got = value[name]
+            if _usable_invoke_value(got):
+                return got
+        return None
+    if value is None:
         return None
     for name in names:
         got = getattr(value, name, None)
-        if got is not None:
+        if _usable_invoke_value(got):
             return got
     return None
+
+
+def _usable_invoke_value(got: Any) -> bool:
+    if got is None or _is_mock_object(got):
+        return False
+    if isinstance(got, str) and not got.strip():
+        return False
+    return True
+
+
+def _field_text(value: Any, *names: str) -> str:
+    got = _invoke_field(value, *names)
+    return got.strip() if isinstance(got, str) else ""
+
+
+def _activity_attachments(activity: Any) -> list:
+    raw = _invoke_field(activity, "attachments")
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, tuple):
+        return list(raw)
+    return []
+
+
+def _attachment_content_dict(content: Any) -> dict:
+    """Normalize ``attachment.content`` (dict, SDK model, or mock) to a mapping."""
+    if isinstance(content, dict):
+        return content
+    if content is None or _is_mock_object(content):
+        return {}
+    dump = getattr(content, "model_dump", None)
+    if callable(dump):
+        for kwargs in ({"by_alias": True}, {}):
+            try:
+                dumped = dump(**kwargs) if kwargs else dump()
+            except TypeError:
+                continue
+            except Exception:
+                dumped = None
+            if isinstance(dumped, dict):
+                return dumped
+            break
+    raw = getattr(content, "__dict__", None)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _is_anonymous_body_mirror(content_type: str, content_url: str, att_name: str) -> bool:
+    """Teams mirrors the message body as an unnamed text/html|text/plain with no URL.
+
+    A *named* ``text/plain`` (for example ``notes.txt``) is a real file, even
+    when the activity omitted ``contentUrl``.
+    """
+    if content_type.startswith("application/vnd.microsoft.card"):
+        return True
+    return content_type in ("text/html", "text/plain") and not content_url and not att_name
 
 
 def _normalize_consent_action(raw: Any) -> str:
@@ -754,7 +824,13 @@ class TeamsAdapter(BasePlatformAdapter):
             user_name=getattr(from_account, "name", None) or "",
             guild_id=getattr(conv, "tenant_id", None) or self._tenant_id,
             message_id=msg_id)
-        media: list = [m for m in [await self._cache_attachment(a) for a in getattr(activity, "attachments", None) or []] if m]
+        graph_target = self._graph_file_target_for(str(conv_id)) if conv_id else None
+        media: list = [
+            m for m in [
+                await self._cache_attachment(a, graph_target=graph_target)
+                for a in _activity_attachments(activity)
+            ] if m
+        ]
         media_kinds = [kind for _, _, kind in media]  # media items are (path, media_type, kind)
         msg_type = next((t for kind, t in _MEDIA_KIND_PRECEDENCE if kind in media_kinds), MessageType.TEXT)
         event = MessageEvent(
@@ -834,34 +910,87 @@ class TeamsAdapter(BasePlatformAdapter):
         source = dataclasses.replace(event.source, user_id=None, user_name=None)
         return dataclasses.replace(event, text=attributed, source=source, channel_prompt=channel_prompt)
 
-    async def _cache_attachment(self, att: Any) -> Optional[tuple]:
+    async def _cache_attachment(self, att: Any, *, graph_target: Any = None) -> Optional[tuple]:
         """Download + cache one inbound attachment → ``(path, media_type, kind)`` or ``None``."""
-        content_url = getattr(att, "content_url", None)
-        content_type = (getattr(att, "content_type", None) or "").lower()
-        att_name = getattr(att, "name", None) or ""
-        # Skip non-file payloads: Teams mirrors the message body as a text/html attachment,
-        # and cards arrive as application/vnd.microsoft.card.*
-        if (content_type in ("text/html", "text/plain") and not content_url) or content_type.startswith("application/vnd.microsoft.card"):
+        content_url = _field_text(att, "content_url", "contentUrl")
+        content_type_raw = _invoke_field(att, "content_type", "contentType")
+        content_type = (
+            content_type_raw.lower().split(";")[0].strip()
+            if isinstance(content_type_raw, str) else ""
+        )
+        att_name = _field_text(att, "name")
+        content = _invoke_field(att, "content")
+        content_map = _attachment_content_dict(content)
+        if content_map:
+            content_keys: list[str] = sorted(str(k) for k in content_map.keys())
+        elif isinstance(content, str):
+            content_keys = ["<inline>"]
+        else:
+            content_keys = []
+        logger.info(
+            "[teams] Inbound attachment name=%r contentType=%s hasUrl=%s contentKeys=%s",
+            att_name, content_type or "-", bool(content_url), content_keys,
+        )
+        if _is_anonymous_body_mirror(content_type, content_url, att_name):
             return None
-        if content_type == "application/vnd.microsoft.teams.file.download.info":
-            # Consent-free download: content carries a pre-authed SharePoint downloadUrl + file type.
-            content = getattr(att, "content", None)
-            if not isinstance(content, dict):
-                content = getattr(content, "__dict__", None) or {}
-            download_url = content.get("downloadUrl") or content.get("download_url")
-            file_type = (content.get("fileType") or content.get("file_type") or "").lstrip(".")
-            if not download_url:
-                return None
-            filename = att_name or (f"document.{file_type}" if file_type else "document")
-            try:
-                data = await self._fetch_attachment_bytes(download_url)
-                cached = await cache_media_bytes_async(data, filename=filename, mime_type="")
-                if not cached:
-                    logger.warning("[teams] Unsupported document type for attachment '%s', skipping", filename)
+        is_file_info = content_type == "application/vnd.microsoft.teams.file.download.info"
+        download_url = _field_text(content_map, "downloadUrl", "download_url")
+        file_type = _field_text(content_map, "fileType", "file_type").lstrip(".")
+        filename = att_name or (f"document.{file_type}" if file_type else "document")
+        if is_file_info or (not content_url and content_map):
+            if is_file_info and not download_url:
+                logger.warning(
+                    "[teams] file.download.info attachment %r has no downloadUrl "
+                    "(contentKeys=%s)",
+                    filename, content_keys,
+                )
+                download_url = await self._resolve_inbound_download_url_via_graph(
+                    content_map, content_url=content_url, filename=filename,
+                    graph_target=graph_target,
+                )
+            if download_url:
+                try:
+                    data = await self._fetch_attachment_bytes(download_url)
+                    cached = await cache_media_bytes_async(data, filename=filename, mime_type="")
+                    if not cached:
+                        logger.warning(
+                            "[teams] Unsupported document type for attachment '%s', skipping",
+                            filename)
+                        return None
+                    return cached.path, cached.media_type, cached.kind
+                except Exception as e:
+                    logger.warning("[teams] Failed to cache file attachment '%s': %s", filename, e)
                     return None
-                return cached.path, cached.media_type, cached.kind
+            if is_file_info:
+                return None
+        if not content_url and att_name and isinstance(content, str) and content:
+            try:
+                cached = await cache_media_bytes_async(
+                    content.encode("utf-8"), filename=att_name, mime_type=content_type)
+                return (cached.path, cached.media_type, cached.kind) if cached else None
             except Exception as e:
-                logger.warning("[teams] Failed to cache file attachment '%s': %s", filename, e)
+                logger.warning(
+                    "[teams] Failed to cache inline attachment '%s' (%s): %s",
+                    att_name, content_type, e)
+                return None
+        if not content_url and att_name:
+            download_url = await self._resolve_inbound_download_url_via_graph(
+                content_map, content_url=content_url, filename=filename,
+                graph_target=graph_target,
+            )
+            if download_url:
+                try:
+                    data = await self._fetch_attachment_bytes(download_url)
+                    cached = await cache_media_bytes_async(
+                        data, filename=filename, mime_type=content_type)
+                    return (cached.path, cached.media_type, cached.kind) if cached else None
+                except Exception as e:
+                    logger.warning("[teams] Failed to cache attachment '%s' (%s): %s", filename, content_type, e)
+                    return None
+            logger.warning(
+                "[teams] Named attachment %r (%s) has no URL and Graph fallback did not resolve one",
+                filename, content_type or "-",
+            )
             return None
         if content_url and content_type.startswith("image/"):
             try:
@@ -889,6 +1018,44 @@ class TeamsAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[teams] Failed to cache attachment '%s' (%s): %s", att_name or content_url, content_type, e)
         return None
+
+    async def _resolve_inbound_download_url_via_graph(
+        self,
+        content_map: dict,
+        *,
+        content_url: str,
+        filename: str,
+        graph_target: Any,
+    ) -> str:
+        """When channel activities omit downloadUrl, resolve one via Graph filesFolder/shares."""
+        from plugins.platforms.teams.graph_files import resolve_inbound_file_download_url
+        client = self._graph_client_for_files()
+        if client is None:
+            logger.warning(
+                "[teams] Inbound file %r has no downloadUrl and Graph is not configured; "
+                "the agent will not see this attachment. Grant Files.ReadWrite.All "
+                "(same MSGRAPH_*/TEAMS_* app as outbound channel uploads).",
+                filename,
+            )
+            return ""
+        try:
+            url = await resolve_inbound_file_download_url(
+                client,
+                target=graph_target,
+                content=content_map,
+                content_url=content_url,
+                filename=filename,
+            )
+        except Exception as e:
+            logger.warning("[teams] Graph inbound file lookup failed for %r: %s", filename, e)
+            return ""
+        if not url:
+            logger.warning(
+                "[teams] Graph inbound file lookup for %r returned no downloadUrl "
+                "(uniqueId/site info missing or filesFolder lookup failed)",
+                filename,
+            )
+        return url or ""
 
     async def _send_card(self, chat_id: str, card: "AdaptiveCard") -> "Any":
         """Send an AdaptiveCard, using a stored ConversationReference when available."""

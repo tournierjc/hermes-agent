@@ -423,7 +423,7 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 
 ### Microsoft Graph（Teams 会议）
 
-用于 Microsoft Graph REST 客户端的仅应用凭证。Teams 会议摘要流水线以及 Teams 适配器向频道/群聊 SharePoint 文件夹上传二进制文件时都会使用。Azure 门户操作步骤和所需 API 权限详见[注册 Microsoft Graph 应用程序](../guides/microsoft-graph-app-registration.md)。频道/群聊文件投递需要应用程序权限 **`Files.ReadWrite.All`** 及管理员同意；未设置 `MSGRAPH_*` 且机器人应用为同一 Entra 注册时，适配器回退到 `TEAMS_*`。
+用于 Microsoft Graph REST 客户端的仅应用凭证。Teams 会议摘要流水线以及 Teams 适配器向频道/群聊 SharePoint 文件夹上传二进制文件（并在入站频道附件缺少 `downloadUrl` 时解析文件）时都会使用。Azure 门户操作步骤和所需 API 权限详见[注册 Microsoft Graph 应用程序](../guides/microsoft-graph-app-registration.md)。频道/群聊文件投递需要应用程序权限 **`Files.ReadWrite.All`** 及管理员同意；未设置 `MSGRAPH_*` 且机器人应用为同一 Entra 注册时，适配器回退到 `TEAMS_*`。
 
 | 变量 | 描述 |
 |----------|-------------|

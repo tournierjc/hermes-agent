@@ -12,10 +12,12 @@ from plugins.platforms.teams.graph_files import (
     SIMPLE_UPLOAD_MAX_BYTES,
     GraphFileTarget,
     GraphFileUploadError,
+    encode_graph_share_id,
     extract_graph_file_target,
     markdown_file_link,
     resolve_graph_credentials,
     resolve_graph_file_target,
+    resolve_inbound_file_download_url,
     safe_graph_filename,
     upload_conversation_file,
 )
@@ -286,3 +288,75 @@ class TestUploadConversationFile:
 
     def test_permission_constant_is_application_files_readwrite_all(self):
         assert GRAPH_CHANNEL_FILE_PERMISSION == "Files.ReadWrite.All"
+
+
+class TestInboundGraphDownloadUrl:
+    def test_encode_graph_share_id_is_u_bang_base64url(self):
+        import base64
+
+        url = "https://contoso.sharepoint.com/sites/team/Shared%20Documents/notes.txt"
+        expected = "u!" + base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+        assert encode_graph_share_id(url) == expected
+
+    @pytest.mark.asyncio
+    async def test_unique_id_uses_files_folder_then_item(self):
+        download = "https://contoso.sharepoint.com/_layouts/download.aspx?x"
+        graph = _FakeGraph()
+
+        async def get_json(path, **kwargs):
+            graph.gets.append(path)
+            if "filesFolder" in path:
+                return graph.folder
+            return {
+                "id": "item-1",
+                "name": "notes.txt",
+                "@microsoft.graph.downloadUrl": download,
+            }
+
+        graph.get_json = get_json  # type: ignore[method-assign]
+        url = await resolve_inbound_file_download_url(
+            graph,
+            target=GraphFileTarget(
+                conversation_type="channel",
+                team_id="team-guid",
+                channel_id="19:chan@thread.tacv2",
+            ),
+            content={"uniqueId": "{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}"},
+            filename="notes.txt",
+        )
+        assert url == download
+        assert any("filesFolder" in path for path in graph.gets)
+        assert any("/items/" in path for path in graph.gets)
+
+    @pytest.mark.asyncio
+    async def test_sharepoint_content_url_uses_shares_api(self):
+        download = "https://contoso.sharepoint.com/_layouts/download.aspx?shared"
+        sharing = "https://contoso.sharepoint.com/:t:/g/team/abc"
+        graph = _FakeGraph()
+
+        async def get_json(path, **kwargs):
+            graph.gets.append(path)
+            if "/shares/" in path:
+                assert encode_graph_share_id(sharing).split("!")[1] in path or "u!" in path
+                return {"@microsoft.graph.downloadUrl": download}
+            raise AssertionError(f"unexpected Graph GET {path}")
+
+        graph.get_json = get_json  # type: ignore[method-assign]
+        url = await resolve_inbound_file_download_url(
+            graph,
+            target=None,
+            content={},
+            content_url=sharing,
+        )
+        assert url == download
+        assert any("/shares/" in path for path in graph.gets)
+
+    @pytest.mark.asyncio
+    async def test_non_sharepoint_url_is_not_sent_to_shares_api(self):
+        graph = _FakeGraph()
+        graph.get_json = AsyncMock(side_effect=AssertionError("must not call Graph"))
+        url = await resolve_inbound_file_download_url(
+            graph,
+            content_url="https://smba.trafficmanager.net/emea/v3/attachments/1",
+        )
+        assert url == ""

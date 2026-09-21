@@ -87,7 +87,7 @@ Teams 机器人无法在频道或群聊中附加二进制文件（Bot Framework 
 
 | 权限 | 允许应用执行的操作 |
 |------------|--------------------------|
-| `Files.ReadWrite.All` | 读取频道/聊天的 `filesFolder`、PUT driveItem 内容（或创建上传会话），以及创建组织范围的查看链接。应用程序权限；**需要管理员同意**。 |
+| `Files.ReadWrite.All` | 读取频道/聊天的 `filesFolder`、PUT driveItem 内容（或创建上传会话）、创建组织范围的查看链接，以及在入站频道附件缺少 `downloadUrl` 时通过 uniqueId/shares API 解析文件。应用程序权限；**需要管理员同意**。 |
 
 `Files.ReadWrite.All` 是租户范围权限。没有更窄的应用程序权限可以上传到任意团队的频道文件夹。建议使用专用 Graph 应用，并用 `TEAMS_ALLOWED_USERS` 限制谁可以给机器人发消息。
 

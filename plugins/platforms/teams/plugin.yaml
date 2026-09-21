@@ -63,14 +63,14 @@ optional_env:
     prompt: "Home channel display name"
     password: false
   - name: MSGRAPH_TENANT_ID
-    description: "Graph tenant ID for channel/group file uploads (falls back to TEAMS_TENANT_ID when the bot app has Files.ReadWrite.All)"
+    description: "Graph tenant ID for channel/group file upload and inbound downloadUrl fallback (falls back to TEAMS_TENANT_ID when the bot app has Files.ReadWrite.All)"
     prompt: "Microsoft Graph tenant ID (optional if TEAMS_* is the same app)"
     password: false
   - name: MSGRAPH_CLIENT_ID
-    description: "Graph application (client) ID for channel/group file uploads (falls back to TEAMS_CLIENT_ID)"
+    description: "Graph application (client) ID for channel/group file upload and inbound downloadUrl fallback (falls back to TEAMS_CLIENT_ID)"
     prompt: "Microsoft Graph client ID (optional if TEAMS_* is the same app)"
     password: false
   - name: MSGRAPH_CLIENT_SECRET
-    description: "Graph client secret for channel/group file uploads (falls back to TEAMS_CLIENT_SECRET)"
+    description: "Graph client secret for channel/group file upload and inbound downloadUrl fallback (falls back to TEAMS_CLIENT_SECRET)"
     prompt: "Microsoft Graph client secret (optional if TEAMS_* is the same app)"
     password: true

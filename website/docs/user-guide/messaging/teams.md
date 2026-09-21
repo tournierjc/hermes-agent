@@ -206,6 +206,10 @@ platforms:
 
 Inbound file attachments (PDFs, Office docs, and other non-image files) are downloaded and cached locally so the agent can read them — the same path Slack/Discord use. Teams delivers these as `file.download.info` attachments (SharePoint `downloadUrl`) or as a Bot Framework `contentUrl`. **Gated messages are dropped before any attachment is downloaded** (see [How the Bot Responds](#how-the-bot-responds)).
 
+Named `text/plain` / `text/html` files (for example a `.txt` drop) are treated as real attachments. Only an *anonymous* `text/html` or `text/plain` payload with no URL and no filename is skipped — that is Teams mirroring the message body.
+
+Channel activities sometimes omit `downloadUrl`. When Graph is configured with the same `MSGRAPH_*` / `TEAMS_*` credentials as outbound SharePoint upload (`Files.ReadWrite.All`), Hermes resolves the file via the channel `filesFolder` + `uniqueId`, or the Graph shares API (`u!` encoding of a SharePoint URL), then downloads the preauthenticated URL. If Graph is not configured and `downloadUrl` is missing, the message text still arrives, a warning is logged, and `media_urls` stays empty — the agent cannot read the file.
+
 To receive files in personal chats, the app manifest must set `"supportsFiles": true` under `bots`. Recreate or update the app if the Teams client silently ignores file drops onto the bot.
 
 To receive **every** channel/group message (needed for `observe_unmentioned`), add RSC to the sideload manifest and reinstall:
@@ -246,7 +250,7 @@ MSGRAPH_CLIENT_SECRET=<client-secret-value>
 
 `Files.ReadWrite.All` is tenant-wide (it can read/write any SharePoint/OneDrive item the app can reach). There is no narrower application permission that can upload into an arbitrary team's channel folder. Treat the app as a service principal and restrict who can message the bot (`TEAMS_ALLOWED_USERS`).
 
-The first inbound activity in a **channel** stashes `channelData.team.aadGroupId` + channel id so the upload can call `GET /teams/{team-id}/channels/{channel-id}/filesFolder`. If the gateway restarted before a file send, set `TEAMS_TEAM_ID` (the Microsoft 365 group GUID) as a fallback. **Group chats** use the Bot Framework conversation id as the Graph chat id (`GET /chats/{id}/filesFolder`) and do not need a team id.
+The first inbound activity in a **channel** stashes `channelData.team.aadGroupId` + channel id so the upload can call `GET /teams/{team-id}/channels/{channel-id}/filesFolder`. The same stash is used when an inbound `file.download.info` attachment omits `downloadUrl`. If the gateway restarted before a file send, set `TEAMS_TEAM_ID` (the Microsoft 365 group GUID) as a fallback. **Group chats** use the Bot Framework conversation id as the Graph chat id (`GET /chats/{id}/filesFolder`) and do not need a team id.
 
 Walkthrough for creating the app registration: [Register a Microsoft Graph application](../../guides/microsoft-graph-app-registration.md#required-for-teams-channelgroup-file-delivery).
 
