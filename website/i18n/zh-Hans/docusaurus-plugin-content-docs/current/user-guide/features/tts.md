@@ -36,7 +36,7 @@ Hermes Agent 支持跨所有消息平台的文字转语音（TTS）输出和语�
 | Telegram | 语音气泡（内联播放） | Opus `.ogg` |
 | Discord | 语音气泡（Opus/OGG），回退为文件附件 | Opus/MP3 |
 | Slack | 音频文件附件 | MP3 |
-| Microsoft Teams | 音频文件附件（频道 Graph 链接回退） | MP3 |
+| Microsoft Teams | 音频文件附件（私信 FileConsent / 频道 Graph 链接，连接器 400 时） | MP3 |
 | WhatsApp | 音频文件附件 | MP3 |
 | CLI | 保存至 `~/.hermes/audio_cache/` | MP3 |
 

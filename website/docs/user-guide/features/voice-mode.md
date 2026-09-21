@@ -307,7 +307,7 @@ Voice mode setting is persisted across gateway restarts.
 | **Telegram** | Voice bubble (Opus/OGG) | Plays inline in chat. ffmpeg converts MP3 → Opus if needed |
 | **Discord** | Native voice bubble (Opus/OGG) | Plays inline like a user voice message. Falls back to file attachment if voice bubble API fails |
 | **Slack** | Audio file attachment | MP3/M4A/OGG uploaded as a Slack file |
-| **Microsoft Teams** | Audio file attachment | Bot Framework `audio/mpeg` in DMs; channel/group falls back to a Graph/SharePoint link if the connector 400s |
+| **Microsoft Teams** | Audio file attachment | Bot Framework `audio/mpeg`; personal DMs fall back to a FileConsent Accept card if the connector 400s base64 audio; channel/group falls back to a Graph/SharePoint link |
 
 ---
 

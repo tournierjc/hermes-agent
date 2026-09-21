@@ -1596,23 +1596,28 @@ class TeamsAdapter(BasePlatformAdapter):
                          metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send TTS/audio as a Bot Framework audio attachment (Slack-like file UX).
 
-        Channel/group chats sometimes 400 on binary attachments the way documents
-        do; fall back to Graph filesFolder upload and post a SharePoint link.
+        The connector often 400s on base64 ``audio/mpeg`` (personal DMs included).
+        Personal/unknown chats fall back to FileConsent; channel/group chats fall
+        back to Graph filesFolder and a SharePoint link.
         """
         result = await self._send_media_attachment(
             chat_id, audio_path, "audio/mpeg", caption=caption, media_label="voice")
         if result.success or audio_path.startswith(("http://", "https://")):
             return result
+        path = audio_path.removeprefix("file://")
+        name = os.path.basename(path) or "voice.mp3"
         conv_type = self._conversation_type(chat_id)
         if conv_type and conv_type != "personal":
             logger.warning(
                 "[teams] Bot Framework voice attachment failed in %s (%s); "
                 "falling back to Graph filesFolder", conv_type, result.error)
-            path = audio_path.removeprefix("file://")
-            name = os.path.basename(path) or "voice.mp3"
             return await self._send_channel_document_via_graph(
                 chat_id, path, caption=caption, file_name=name)
-        return result
+        logger.warning(
+            "[teams] Bot Framework voice attachment failed in personal chat (%s); "
+            "falling back to FileConsent", result.error)
+        return await self._send_file_consent(
+            chat_id, path, caption=caption, file_name=name)
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
                             reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:

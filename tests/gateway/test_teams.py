@@ -1585,6 +1585,35 @@ class TestTeamsMediaAttachments:
         adapter._app.send.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_send_voice_personal_falls_back_to_file_consent(self, tmp_path):
+        from gateway.platforms.base import SendResult
+
+        adapter = self._make_adapter()
+        adapter._conv_refs["a:dmConversation"] = SimpleNamespace(
+            conversation=SimpleNamespace(conversation_type="personal"))
+        audio = tmp_path / "reply.mp3"
+        audio.write_bytes(b"ID3fakeaudio")
+        adapter._send_media_attachment = AsyncMock(
+            return_value=SendResult(success=False, error="400 Bad Request", retryable=True))
+        adapter._send_file_consent = AsyncMock(
+            return_value=SendResult(success=True, message_id="consent-1"))
+        adapter._send_channel_document_via_graph = AsyncMock(
+            side_effect=AssertionError("personal TTS must not use Graph"))
+
+        result = await adapter.send_voice(
+            "a:dmConversation", str(audio), caption="spoken reply")
+
+        assert result.success
+        assert result.message_id == "consent-1"
+        adapter._send_file_consent.assert_awaited_once()
+        call = adapter._send_file_consent.await_args
+        assert call.args[0] == "a:dmConversation"
+        assert call.args[1] == str(audio)
+        assert call.kwargs["caption"] == "spoken reply"
+        assert call.kwargs["file_name"] == "reply.mp3"
+        adapter._send_channel_document_via_graph.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_send_voice_channel_prefers_attachment(self, tmp_path):
         adapter = self._make_adapter()
         adapter._conv_refs["19:chan@thread.tacv2"] = SimpleNamespace(

@@ -239,7 +239,7 @@ DISCORD_FREE_RESPONSE_CHANNELS=123456789,987654321
 | **Telegram** | 语音气泡（Opus/OGG） | 在聊天中内联播放。如需要，ffmpeg 将 MP3 转换为 Opus |
 | **Discord** | 原生语音气泡（Opus/OGG） | 像用户语音消息一样内联播放。如语音气泡 API 失败则回退为文件附件 |
 | **Slack** | 音频文件附件 | MP3/M4A/OGG 作为 Slack 文件上传 |
-| **Microsoft Teams** | 音频文件附件 | 私信使用 Bot Framework `audio/mpeg`；频道/群聊在连接器 400 时回退为 Graph/SharePoint 链接 |
+| **Microsoft Teams** | 音频文件附件 | Bot Framework `audio/mpeg`；若连接器拒绝 base64 音频，私信回退为 FileConsent 接受卡片，频道/群聊回退为 Graph/SharePoint 链接 |
 
 ---
 
