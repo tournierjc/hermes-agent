@@ -538,6 +538,31 @@ class TestTeamsMessageHandling:
         assert event.source.chat_type == "group"
 
     @pytest.mark.anyio
+    async def test_channel_message_stashes_graph_file_target(self):
+        from plugins.platforms.teams.graph_files import GraphFileTarget
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+        ))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(
+            conversation_id="19:chan@thread.tacv2", conversation_type="channel")
+        activity.channel_data = {
+            "team": {"aadGroupId": "team-guid", "id": "19:team@thread.skype"},
+            "channel": {"id": "19:chan@thread.tacv2"},
+        }
+        await adapter._on_message(self._make_ctx(activity))
+
+        assert adapter._graph_file_targets["19:chan@thread.tacv2"] == GraphFileTarget(
+            conversation_type="channel",
+            team_id="team-guid",
+            channel_id="19:chan@thread.tacv2",
+        )
+
+    @pytest.mark.anyio
     async def test_aad_user_route_survives_conversation_changes(self, monkeypatch):
         from gateway.profile_routing import parse_profile_routes
         from gateway.run import GatewayRunner
@@ -1159,6 +1184,8 @@ class TestTeamsMediaAttachments:
         adapter._app.id = "bot-id"
         adapter._app.send = AsyncMock(return_value=MagicMock(id="msg-001"))
         adapter._app.activity_sender.send = AsyncMock(return_value=MagicMock(id="msg-001"))
+        # Do not construct a real Graph token client in tests (would hit Azure).
+        adapter._graph_client = False
         return adapter
 
 
@@ -1227,9 +1254,13 @@ class TestTeamsMediaAttachments:
         assert "400" not in (result.error or "")
         assert "FileConsent" in result.error
         assert "DM" in result.error or "1:1" in result.error
+        assert "Graph" in result.error or "MSGRAPH_" in result.error
         adapter._app.activity_sender.send.assert_not_awaited()
         adapter._app.send.assert_awaited()
         assert "report.pdf" in adapter._app.send.await_args.args[1]
+        # Never revive Bot Framework document attachments in channels.
+        sent = adapter._app.send.await_args.args[1]
+        assert not hasattr(sent, "add_attachments")
 
     @pytest.mark.asyncio
     async def test_send_document_channel_oversize_text_is_not_inlined(self, tmp_path):
@@ -1240,6 +1271,118 @@ class TestTeamsMediaAttachments:
         doc.write_text("x" * (_teams_mod._INLINE_CHANNEL_TEXT_MAX_BYTES + 1))
         result = await adapter.send_document("19:abc@thread.v2", str(doc), file_name="huge.txt")
         assert not result.success
+        assert "FileConsent" in result.error
+
+    @pytest.mark.asyncio
+    async def test_send_document_channel_binary_uploads_via_graph(self, tmp_path):
+        from plugins.platforms.teams.graph_files import GraphFileTarget, GraphUploadedFile
+
+        adapter = self._make_adapter()
+        adapter._conv_refs["19:chan@thread.tacv2"] = SimpleNamespace(
+            conversation=SimpleNamespace(conversation_type="channel"))
+        adapter._graph_file_targets["19:chan@thread.tacv2"] = GraphFileTarget(
+            conversation_type="channel",
+            team_id="team-guid",
+            channel_id="19:chan@thread.tacv2",
+        )
+        adapter._graph_client = object()
+        doc = tmp_path / "report.pdf"
+        doc.write_bytes(b"%PDF-1.4 binary")
+
+        async def _upload(graph, target, *, file_name, data, content_type="application/octet-stream", **_kw):
+            assert graph is adapter._graph_client
+            assert target.team_id == "team-guid"
+            assert file_name == "report.pdf"
+            assert data.startswith(b"%PDF")
+            return GraphUploadedFile(
+                name="report.pdf",
+                web_url="https://contoso.sharepoint.com/sites/team/report.pdf",
+                share_url="https://contoso.sharepoint.com/:b:/s/team/abc",
+            )
+
+        with patch("plugins.platforms.teams.graph_files.upload_conversation_file", _upload):
+            result = await adapter.send_document(
+                "19:chan@thread.tacv2", str(doc), file_name="report.pdf", caption="Q3 report")
+
+        assert result.success
+        adapter._app.send.assert_awaited()
+        sent = adapter._app.send.await_args.args[1]
+        assert "Q3 report" in sent
+        assert "https://contoso.sharepoint.com/:b:/s/team/abc" in sent
+        assert "report.pdf" in sent
+        adapter._app.activity_sender.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_document_group_binary_uploads_via_graph(self, tmp_path):
+        from plugins.platforms.teams.graph_files import GraphUploadedFile
+
+        adapter = self._make_adapter()
+        adapter._conv_refs["19:chat@thread.v2"] = SimpleNamespace(
+            conversation=SimpleNamespace(conversation_type="groupChat"))
+        adapter._graph_client = object()
+        doc = tmp_path / "deck.pptx"
+        doc.write_bytes(b"PK\x03\x04fake-pptx")
+
+        async def _upload(graph, target, *, file_name, data, **_kw):
+            assert target.conversation_type == "groupChat"
+            assert target.chat_id == "19:chat@thread.v2"
+            return GraphUploadedFile(
+                name="deck.pptx",
+                web_url="https://contoso-my.sharepoint.com/personal/bot/deck.pptx",
+            )
+
+        with patch("plugins.platforms.teams.graph_files.upload_conversation_file", _upload):
+            result = await adapter.send_document(
+                "19:chat@thread.v2", str(doc), file_name="deck.pptx")
+
+        assert result.success
+        sent = adapter._app.send.await_args.args[1]
+        assert "deck.pptx" in sent
+        assert "https://contoso-my.sharepoint.com/personal/bot/deck.pptx" in sent
+
+    @pytest.mark.asyncio
+    async def test_send_document_channel_graph_403_mentions_permissions(self, tmp_path):
+        from plugins.platforms.teams.graph_files import GraphFileTarget
+        from tools.microsoft_graph_client import MicrosoftGraphAPIError
+
+        adapter = self._make_adapter()
+        adapter._conv_refs["19:chan@thread.tacv2"] = SimpleNamespace(
+            conversation=SimpleNamespace(conversation_type="channel"))
+        adapter._graph_file_targets["19:chan@thread.tacv2"] = GraphFileTarget(
+            conversation_type="channel", team_id="team-guid",
+            channel_id="19:chan@thread.tacv2")
+        adapter._graph_client = object()
+        doc = tmp_path / "report.pdf"
+        doc.write_bytes(b"%PDF-1.4 binary")
+
+        async def _upload(*_a, **_k):
+            raise MicrosoftGraphAPIError(
+                403, "GET", "/teams/team-guid/channels/x/filesFolder", "Access denied")
+
+        with patch("plugins.platforms.teams.graph_files.upload_conversation_file", _upload):
+            result = await adapter.send_document(
+                "19:chan@thread.tacv2", str(doc), file_name="report.pdf")
+
+        assert not result.success
+        assert "403" in (result.error or "")
+        assert "Files.ReadWrite.All" in result.error
+        assert "FileConsent" in result.error
+        sent = adapter._app.send.await_args.args[1]
+        assert "report.pdf" in sent
+        adapter._app.activity_sender.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_document_channel_missing_team_id_is_clear(self, tmp_path):
+        adapter = self._make_adapter()
+        adapter._graph_client = object()
+        adapter._conv_refs["19:chan@thread.tacv2"] = SimpleNamespace(
+            conversation=SimpleNamespace(conversation_type="channel"))
+        doc = tmp_path / "report.pdf"
+        doc.write_bytes(b"%PDF-1.4 binary")
+        result = await adapter.send_document(
+            "19:chan@thread.tacv2", str(doc), file_name="report.pdf")
+        assert not result.success
+        assert "TEAMS_TEAM_ID" in result.error
         assert "FileConsent" in result.error
 
     def test_inlineable_channel_document_helpers(self, tmp_path):

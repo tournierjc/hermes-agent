@@ -175,6 +175,10 @@ Open the printed link in your browser — it opens directly in the Teams client.
 | `TEAMS_REQUIRE_MENTION` | Set `true` to answer only @mentions / replies to the bot in channels and group chats (default: `false`; required once the app has RSC message-read consent) |
 | `TEAMS_OBSERVE_UNMENTIONED` | When `require_mention` is on, store un-@mentioned channel/group posts as observed context (default: `true`). No-op without RSC. Set `false` to drop them. |
 | `TEAMS_REACTIONS` | Set `false` to disable processing-status emoji reactions (👀 while working, ✅/❌ on complete). Default: enabled. Agent `send_message` react/unreact is always available. |
+| `MSGRAPH_TENANT_ID` | Graph tenant ID for channel/group file uploads. Falls back to `TEAMS_TENANT_ID` when the bot app has `Files.ReadWrite.All`. |
+| `MSGRAPH_CLIENT_ID` | Graph application (client) ID. Falls back to `TEAMS_CLIENT_ID`. |
+| `MSGRAPH_CLIENT_SECRET` | Graph client secret. Falls back to `TEAMS_CLIENT_SECRET`. |
+| `TEAMS_TEAM_ID` | Microsoft 365 group GUID for the team; fallback when channel `aadGroupId` has not been stashed yet (also used by meeting-summary Graph delivery). |
 
 ### config.yaml
 
@@ -219,10 +223,32 @@ A full sideload skeleton lives at `plugins/platforms/teams/manifest.template.jso
 Outbound files:
 
 - **Personal chats** — the bot sends a native **file consent card**. The user taps Accept, Hermes uploads the bytes to that user's OneDrive, then posts a file-info card. This is the Bot Framework-supported send path (no extra Graph permissions).
-- **Channel / group chats** — FileConsent is personal-scope only, and Bot Framework document attachments return 400. Small text files (``.txt``, ``.md``, ``.csv``, … under ~48 KB) are inlined as a normal message. Binary files get a clear error pointing at a 1:1 DM (FileConsent) or Graph/SharePoint — not a raw 400.
+- **Channel / group chats** — FileConsent is personal-scope only, and Bot Framework document attachments return 400. Small text files (``.txt``, ``.md``, ``.csv``, … under ~48 KB) are inlined as a normal message. Other files are uploaded with **app-only Microsoft Graph** into the team's SharePoint channel folder (or the group chat's files folder), then Hermes posts a clickable sharing/`webUrl` link in the same conversation. Configure Graph as below; if Graph is missing or the upload is denied, the bot posts a clear error (and you can still send the file in a 1:1 DM).
 - **Images / video / audio** — sent as Bot Framework attachments (data URI for local files, URL for remote). Images already worked this way.
 
-Size cap for consent uploads is 20 MB.
+Size cap for consent uploads and Graph channel uploads is 20 MB.
+
+#### Channel / group file upload (Microsoft Graph)
+
+Hermes reuses the shared Graph client (`tools/microsoft_graph_client.py`) with **client-credentials** (daemon) auth. Preferred credentials are `MSGRAPH_TENANT_ID` / `MSGRAPH_CLIENT_ID` / `MSGRAPH_CLIENT_SECRET`. If those are unset, the adapter falls back to the Teams bot app (`TEAMS_*`) — that works when it is the **same Entra app** and an admin has consented the Graph application permission below.
+
+1. In [Entra app registrations](https://entra.microsoft.com) open the Graph app (or the Teams bot app, if you are reusing it).
+2. **API permissions → Microsoft Graph → Application permissions** → add **`Files.ReadWrite.All`**.
+3. Click **Grant admin consent for \<tenant\>**. Status must show a green check. Delegated permissions are not used; the gateway has no user sign-in for this path.
+4. Put the credentials in `~/.hermes/.env` (`chmod 600`):
+
+```bash
+MSGRAPH_TENANT_ID=<directory-tenant-id>
+MSGRAPH_CLIENT_ID=<application-client-id>
+MSGRAPH_CLIENT_SECRET=<client-secret-value>
+# Optional: omit MSGRAPH_* and grant Files.ReadWrite.All on the TEAMS_* bot app instead
+```
+
+`Files.ReadWrite.All` is tenant-wide (it can read/write any SharePoint/OneDrive item the app can reach). There is no narrower application permission that can upload into an arbitrary team's channel folder. Treat the app as a service principal and restrict who can message the bot (`TEAMS_ALLOWED_USERS`).
+
+The first inbound activity in a **channel** stashes `channelData.team.aadGroupId` + channel id so the upload can call `GET /teams/{team-id}/channels/{channel-id}/filesFolder`. If the gateway restarted before a file send, set `TEAMS_TEAM_ID` (the Microsoft 365 group GUID) as a fallback. **Group chats** use the Bot Framework conversation id as the Graph chat id (`GET /chats/{id}/filesFolder`) and do not need a team id.
+
+Walkthrough for creating the app registration: [Register a Microsoft Graph application](../../guides/microsoft-graph-app-registration.md#required-for-teams-channelgroup-file-delivery).
 
 ### Reactions
 

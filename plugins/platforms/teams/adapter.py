@@ -93,7 +93,8 @@ _CONTENT_TYPE_FILE_INFO = "application/vnd.microsoft.teams.card.file.info"
 _MAX_FILE_SEND_BYTES = 20 * 1024 * 1024
 _PENDING_UPLOAD_MAX = 32
 # Channel/group chats reject Bot Framework document attachments (400). Small text
-# files are inlined; anything else needs FileConsent (DM) or Graph/SharePoint.
+# files are inlined; anything else uploads via Graph into the team's SharePoint
+# folder (or FileConsent in a 1:1 DM).
 _INLINE_CHANNEL_TEXT_MAX_BYTES = 48 * 1024
 _INLINE_CHANNEL_TEXT_EXTS = frozenset({
     ".txt", ".md", ".markdown", ".rst", ".csv", ".tsv",
@@ -102,10 +103,27 @@ _INLINE_CHANNEL_TEXT_EXTS = frozenset({
     ".py", ".rs", ".js", ".ts", ".tsx", ".jsx",
     ".go", ".rb", ".sh",
 })
-_CHANNEL_FILE_UNSUPPORTED = (
+_CHANNEL_FILE_GRAPH_NOT_CONFIGURED = (
     "Can't attach this file in a Teams channel or group chat. FileConsent cards "
-    "work only in a 1:1 chat with the bot; binary channel files need Graph/SharePoint. "
-    "Send the file in a DM, or share it from SharePoint."
+    "work only in a 1:1 chat with the bot. Binary channel/group files upload via "
+    "Microsoft Graph to the team's SharePoint folder, but Graph is not configured. "
+    "Set MSGRAPH_TENANT_ID, MSGRAPH_CLIENT_ID, and MSGRAPH_CLIENT_SECRET (or grant "
+    "Files.ReadWrite.All to the Teams bot app and reuse TEAMS_*), then grant admin "
+    "consent. Meanwhile send the file in a 1:1 DM."
+)
+_CHANNEL_FILE_GRAPH_NO_TARGET = (
+    "Can't attach this file in a Teams channel or group chat: Hermes does not yet "
+    "know this channel's team id (needed for SharePoint). Send a message in the "
+    "channel first, or set TEAMS_TEAM_ID. FileConsent works in a 1:1 DM."
+)
+_CHANNEL_FILE_GRAPH_PERMISSIONS = (
+    "Can't attach this file in a Teams channel or group chat: Microsoft Graph "
+    "returned {status} ({detail}). The app needs admin-consented application "
+    "permission Files.ReadWrite.All. FileConsent still works in a 1:1 DM."
+)
+_CHANNEL_FILE_GRAPH_FAILED = (
+    "Can't attach this file in a Teams channel or group chat: {detail}. "
+    "FileConsent cards work only in a 1:1 chat with the bot."
 )
 # OneDrive upload session hosts for file-consent PUT (exact suffix; blocks lookalikes).
 _ONEDRIVE_UPLOAD_HOSTS = frozenset({
@@ -530,6 +548,10 @@ class TeamsAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator(max_size=1000)
         # chat_id → ConversationReference so proactive cards use the right conversation type.
         self._conv_refs: Dict[str, Any] = {}
+        # chat_id → GraphFileTarget (team aadGroupId / channel id / group chat id) from inbound
+        # channelData. Tests inject ``_graph_client`` (client or False to disable).
+        self._graph_file_targets: Dict[str, Any] = {}
+        self._graph_client: Any = None
         self._require_mention: bool = self._parse_require_mention(config)
         self._observe_unmentioned: bool = self._parse_observe_unmentioned(config)
         # Outbound activity ids (bounded) so require_mention can exempt replies to our own messages.
@@ -700,6 +722,7 @@ class TeamsAdapter(BasePlatformAdapter):
         conv_id = getattr(conv, "id", None)
         if conv_id:  # cache the conversation reference for proactive sends (approval cards, etc.)
             self._conv_refs[conv_id] = ctx.conversation_ref
+            self._remember_graph_file_target(str(conv_id), activity)
         text = activity.text if hasattr(activity, "text") and activity.text else ""
         conv_type = getattr(conv, "conversation_type", None)
         addressed = True
@@ -1052,8 +1075,8 @@ class TeamsAdapter(BasePlatformAdapter):
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
                             reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send a file. Personal chats use FileConsent; channel/group local files are
-        inlined when they are small text, otherwise a clear error (Bot Framework
-        document attachments 400 in channels). Remote URLs stay attachments."""
+        inlined when they are small text, otherwise uploaded via Graph/SharePoint
+        (Bot Framework document attachments 400 in channels). Remote URLs stay attachments."""
         if file_path.startswith(("http://", "https://")):
             return await self._send_media_attachment(
                 chat_id, file_path, "application/octet-stream", caption=caption,
@@ -1068,7 +1091,10 @@ class TeamsAdapter(BasePlatformAdapter):
     async def _send_channel_document(
         self, chat_id: str, file_path: str, *, caption: Optional[str] = None, file_name: Optional[str] = None,
     ) -> SendResult:
-        """Channel/group file send: inline small text, never base64 document attachments."""
+        """Channel/group file send: inline small text, else Graph → SharePoint link.
+
+        Never base64 document attachments (Bot Framework returns 400 in channels).
+        """
         path = file_path.removeprefix("file://")
         name = file_name or os.path.basename(path) or "file"
         if _is_inlineable_channel_document(path, name):
@@ -1079,16 +1105,128 @@ class TeamsAdapter(BasePlatformAdapter):
                 if caption:
                     body = f"{caption}\n\n{body}"
                 return await self.send(chat_id, body)
-        note = f"`{name}` — {_CHANNEL_FILE_UNSUPPORTED}"
+        return await self._send_channel_document_via_graph(
+            chat_id, path, caption=caption, file_name=name)
+
+    def _remember_graph_file_target(self, chat_id: str, activity: Any) -> None:
+        """Stash Graph team/channel/chat ids from inbound channelData for later uploads."""
+        from plugins.platforms.teams.graph_files import extract_graph_file_target
+        target = extract_graph_file_target(activity)
+        if target is not None:
+            self._graph_file_targets[chat_id] = target
+
+    def _graph_client_for_files(self) -> Any:
+        """Injected client, ``False`` to disable, or app-only Graph credentials."""
+        injected = self._graph_client
+        if injected is not None:
+            return None if injected is False else injected
+        from plugins.platforms.teams.graph_files import resolve_graph_credentials
+        from tools.microsoft_graph_auth import MicrosoftGraphTokenProvider
+        from tools.microsoft_graph_client import MicrosoftGraphClient
+        creds = resolve_graph_credentials(
+            teams_tenant_id=self._tenant_id or "",
+            teams_client_id=self._client_id or "",
+            teams_client_secret=self._client_secret or "",
+        )
+        if creds is None:
+            return None
+        return MicrosoftGraphClient(MicrosoftGraphTokenProvider(creds))
+
+    def _graph_file_target_for(self, chat_id: str) -> Any:
+        from plugins.platforms.teams.graph_files import resolve_graph_file_target
+        extra_team = str(
+            self._extra.get("team_id") or _get_scoped_secret("TEAMS_TEAM_ID", "") or ""
+        ).strip()
+        extra_channel = str(
+            self._extra.get("channel_id") or _get_scoped_secret("TEAMS_CHANNEL_ID", "") or ""
+        ).strip()
+        return resolve_graph_file_target(
+            chat_id,
+            conv_type=self._conversation_type(chat_id),
+            cached=self._graph_file_targets.get(chat_id),
+            extra_team_id=extra_team,
+            extra_channel_id=extra_channel,
+        )
+
+    async def _channel_file_failure(self, chat_id: str, name: str, note: str) -> SendResult:
+        text = f"`{name}` — {note}"
         with suppress(Exception):
-            await self.send(chat_id, note)
-        return SendResult(success=False, error=note)
+            await self.send(chat_id, text)
+        return SendResult(success=False, error=text)
+
+    async def _send_channel_document_via_graph(
+        self, chat_id: str, path: str, *, caption: Optional[str] = None, file_name: str,
+    ) -> SendResult:
+        """Upload a binary (or oversized text) file via Graph and post a SharePoint link."""
+        import mimetypes
+        from plugins.platforms.teams.graph_files import (
+            GraphFileTargetError, GraphFileUploadError, markdown_file_link, upload_conversation_file,
+        )
+        from tools.microsoft_graph_auth import MicrosoftGraphAuthError, MicrosoftGraphConfigError
+        from tools.microsoft_graph_client import MicrosoftGraphAPIError, MicrosoftGraphClientError
+
+        try:
+            size = os.path.getsize(path)
+        except OSError as e:
+            return SendResult(success=False, error=f"Cannot read file: {e}")
+        if size > _MAX_FILE_SEND_BYTES:
+            return await self._channel_file_failure(
+                chat_id, file_name,
+                f"File exceeds Teams send limit ({_MAX_FILE_SEND_BYTES // (1024 * 1024)} MB). "
+                "FileConsent cards work only in a 1:1 chat with the bot.")
+        if size == 0:
+            return await self._channel_file_failure(
+                chat_id, file_name, "File is empty. FileConsent cards work only in a 1:1 chat with the bot.")
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as e:
+            return SendResult(success=False, error=f"Cannot read file: {e}")
+
+        client = self._graph_client_for_files()
+        if client is None:
+            return await self._channel_file_failure(chat_id, file_name, _CHANNEL_FILE_GRAPH_NOT_CONFIGURED)
+        target = self._graph_file_target_for(chat_id)
+        if target is None:
+            return await self._channel_file_failure(chat_id, file_name, _CHANNEL_FILE_GRAPH_NO_TARGET)
+        mime_type = mimetypes.guess_type(file_name or path)[0] or "application/octet-stream"
+        try:
+            uploaded = await upload_conversation_file(
+                client, target, file_name=file_name, data=data, content_type=mime_type)
+        except MicrosoftGraphConfigError:
+            return await self._channel_file_failure(chat_id, file_name, _CHANNEL_FILE_GRAPH_NOT_CONFIGURED)
+        except MicrosoftGraphAPIError as e:
+            detail = str(e)
+            if e.status_code in (401, 403):
+                note = _CHANNEL_FILE_GRAPH_PERMISSIONS.format(status=e.status_code, detail=detail)
+            else:
+                note = _CHANNEL_FILE_GRAPH_FAILED.format(detail=detail)
+            logger.warning("[teams] Graph channel file upload failed: %s", e)
+            return await self._channel_file_failure(chat_id, file_name, note)
+        except (MicrosoftGraphAuthError, MicrosoftGraphClientError, GraphFileUploadError, GraphFileTargetError) as e:
+            logger.warning("[teams] Graph channel file upload failed: %s", e)
+            return await self._channel_file_failure(
+                chat_id, file_name, _CHANNEL_FILE_GRAPH_FAILED.format(detail=str(e)))
+        except Exception as e:
+            logger.error("[teams] Graph channel file upload failed: %s", e, exc_info=True)
+            return await self._channel_file_failure(
+                chat_id, file_name, _CHANNEL_FILE_GRAPH_FAILED.format(detail=str(e)))
+
+        url = uploaded.link
+        body = f"**{uploaded.name}**\n{markdown_file_link(uploaded.name, url)}"
+        if caption:
+            body = f"{caption}\n\n{body}"
+        return await self.send(chat_id, body)
 
     def _conversation_type(self, chat_id: str) -> Optional[str]:
         """Cached conversation_type for ``chat_id``, or ``None`` when unseen this process."""
         ref = self._conv_refs.get(chat_id)
         conv = getattr(ref, "conversation", None)
-        return getattr(conv, "conversation_type", None) or getattr(conv, "conversationType", None)
+        cached_type = getattr(conv, "conversation_type", None) or getattr(conv, "conversationType", None)
+        if cached_type:
+            return cached_type
+        target = self._graph_file_targets.get(chat_id)
+        return getattr(target, "conversation_type", None)
 
     async def get_chat_info(self, chat_id: str) -> dict:
         return {"name": chat_id, "type": "unknown", "chat_id": chat_id}

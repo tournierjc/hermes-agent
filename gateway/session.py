@@ -360,10 +360,11 @@ _TEAMS_PLATFORM_NOTE = (
     "in this session — never claim it is missing or unavailable. To deliver a file in THIS chat: "
     "write it to disk, then include `MEDIA:<absolute_path>` in your final reply text. In a 1:1 "
     "chat the gateway sends a native FileConsent card. In a channel or group chat, small text "
-    "files (``.txt``, ``.md``, ``.csv``, …) are inlined in the reply; binary file cards need a "
-    "DM (FileConsent) or Graph/SharePoint — do not expect a channel file attachment. Do not "
-    "invent tool names. Normal replies are already posted to this chat; no special send tool is "
-    "required for text."
+    "files (``.txt``, ``.md``, ``.csv``, …) are inlined in the reply; other files are uploaded "
+    "to the team's SharePoint folder via Microsoft Graph and a clickable link is posted here "
+    "(requires Graph app permissions — see the Teams docs). Do not expect a Bot Framework file "
+    "attachment in channels. Do not invent tool names. Normal replies are already posted to this "
+    "chat; no special send tool is required for text."
 )
 
 
