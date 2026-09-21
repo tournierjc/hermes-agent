@@ -31,7 +31,7 @@ Hermes Agent 支持在 CLI 和消息平台上进行完整的语音交互。通�
 | 功能 | 平台 | 说明 |
 |---------|----------|-------------|
 | **交互式语音** | CLI | 按 Ctrl+B 开始录音，Agent 自动检测静音并回复 |
-| **自动语音回复** | Telegram、Discord | Agent 在文字回复的同时发送语音音频 |
+| **自动语音回复** | Telegram、Discord、Slack、Teams | Agent 在文字回复的同时发送语音音频 |
 | **语音频道** | Discord | Bot 加入语音频道，监听用户发言并语音回复 |
 
 ## 环境要求
@@ -171,11 +171,13 @@ Whisper 有时会从静音或背景噪音中生成幻觉文字（如"Thank you f
 
 ---
 
-## Gateway 语音回复（Telegram 和 Discord）
+## Gateway 语音回复（Telegram、Discord、Slack、Teams）
 
 如果尚未设置消息机器人，请参阅对应平台的指南：
 - [Telegram 设置指南](../messaging/telegram.md)
 - [Discord 设置指南](../messaging/discord.md)
+- [Slack 设置指南](../messaging/slack.md)
+- [Microsoft Teams 设置指南](../messaging/teams.md)
 
 启动 gateway 以连接到消息平台：
 
@@ -210,7 +212,7 @@ DISCORD_FREE_RESPONSE_CHANNELS=123456789,987654321
 
 ### 命令
 
-以下命令在 Telegram 和 Discord（私信和文字频道）中均可使用：
+以下命令在 Telegram、Discord、Slack 和 Teams（私信和文字频道）中均可使用：
 
 ```
 /voice          切换语音模式开/关
@@ -236,6 +238,8 @@ DISCORD_FREE_RESPONSE_CHANNELS=123456789,987654321
 |----------|--------|-------|
 | **Telegram** | 语音气泡（Opus/OGG） | 在聊天中内联播放。如需要，ffmpeg 将 MP3 转换为 Opus |
 | **Discord** | 原生语音气泡（Opus/OGG） | 像用户语音消息一样内联播放。如语音气泡 API 失败则回退为文件附件 |
+| **Slack** | 音频文件附件 | MP3/M4A/OGG 作为 Slack 文件上传 |
+| **Microsoft Teams** | 音频文件附件 | 私信使用 Bot Framework `audio/mpeg`；频道/群聊在连接器 400 时回退为 Graph/SharePoint 链接 |
 
 ---
 

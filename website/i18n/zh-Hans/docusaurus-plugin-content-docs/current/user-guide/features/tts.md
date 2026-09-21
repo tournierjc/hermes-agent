@@ -35,6 +35,8 @@ Hermes Agent 支持跨所有消息平台的文字转语音（TTS）输出和语�
 |----------|----------|--------|
 | Telegram | 语音气泡（内联播放） | Opus `.ogg` |
 | Discord | 语音气泡（Opus/OGG），回退为文件附件 | Opus/MP3 |
+| Slack | 音频文件附件 | MP3 |
+| Microsoft Teams | 音频文件附件（频道 Graph 链接回退） | MP3 |
 | WhatsApp | 音频文件附件 | MP3 |
 | CLI | 保存至 `~/.hermes/audio_cache/` | MP3 |
 
@@ -378,7 +380,7 @@ def register(ctx):
 
 ## 语音消息转录（STT）
 
-在 Telegram、Discord、WhatsApp、Slack 或 Signal 上发送的语音消息会被自动转录并作为文本注入对话。Agent 将转录内容视为普通文本。
+在 Telegram、Discord、WhatsApp、Slack、Signal 或 Microsoft Teams 上发送的语音消息会被自动转录并作为文本注入对话。Agent 将转录内容视为普通文本。
 
 | 提供商 | 质量 | 费用 | API 密钥 |
 |----------|---------|------|---------| 
