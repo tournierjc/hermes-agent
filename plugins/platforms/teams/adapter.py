@@ -20,6 +20,7 @@ import inspect
 import json
 import logging
 import os
+import random
 import re
 import sys
 import uuid
@@ -69,6 +70,7 @@ from gateway.platforms._shared import (
     coerce_port, extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
     seed_extra_from_env as _seed_extra_from_env, send_error
 )
+from plugins.platforms.teams.rate_budget import ConversationRateBudget
 
 logger = logging.getLogger(__name__)
 
@@ -155,9 +157,19 @@ _REACTION_EMOJI_BY_TYPE = {
     "laugh": "😆", "surprised": "😮", "sad": "😢", "angry": "😠",
 }
 _REACTION_TYPE_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
-# Inline wait for HTTP 429 on activity updates; longer Retry-After fails the edit so
-# the stream consumer falls back to a single non-streaming send (Telegram flood pattern).
-_EDIT_FLOOD_INLINE_WAIT_CAP_SECS = 2.0
+# Edit cadence, read by the gateway through ``MIN_PROGRESS_EDIT_INTERVAL`` /
+# ``MIN_STREAM_EDIT_INTERVAL``: tool-progress bubble vs streamed answer. Teams meters typing,
+# sends and edits against one per-conversation quota, so both are slower than the gateway
+# defaults. ``extra.progress_edit_interval`` / ``extra.stream_edit_interval`` override them
+# (clamped to the minimums).
+_PROGRESS_EDIT_INTERVAL_SECS, _PROGRESS_EDIT_INTERVAL_MIN_SECS = 5.0, 2.0
+_STREAM_EDIT_INTERVAL_SECS, _STREAM_EDIT_INTERVAL_MIN_SECS = 2.5, 1.5
+# A finalize=True edit carries the complete answer: transient failures (429, 412, 5xx,
+# transport) are retried with Retry-After or exponential backoff + jitter. A longer
+# Retry-After fails the edit so the stream consumer falls back to a plain send.
+_FINAL_EDIT_ATTEMPTS = 3
+_FINAL_EDIT_BACKOFF_MAX_SECS = 8.0
+_FINAL_EDIT_RETRY_AFTER_CAP_SECS = 10.0
 _EDIT_CACHE_MAX = 64
 
 
@@ -268,6 +280,38 @@ def _activity_update_unsupported(exc: BaseException, status: Optional[int]) -> b
         "method not allowed", "not supported", "cannot be updated",
         "activity not found", "message not found",
     ))
+
+
+def _edit_interval_setting(extra: Optional[dict], key: str, default: float, minimum: float) -> float:
+    """``platforms.teams.extra[key]`` as positive seconds (unset/invalid → ``default``), >= ``minimum``."""
+    raw = (extra or {}).get(key)
+    try:
+        value = default if raw is None or raw == "" or isinstance(raw, bool) else float(raw)
+    except (TypeError, ValueError):
+        logger.warning("[teams] ignoring invalid %s=%r (using %.1fs)", key, raw, default)
+        value = default
+    if not value > 0:  # also rejects NaN
+        value = default
+    return max(minimum, value)
+
+
+def _final_edit_retry_delay(
+    exc: BaseException, status: Optional[int], retry_after: Optional[float], attempt: int,
+) -> Optional[float]:
+    """Seconds before retrying a failed ``finalize=True`` edit, or ``None`` when a retry cannot
+    help (bad ids, unsupported update, other 4xx, or a Retry-After past the inline cap).
+    Activity updates are idempotent, so retrying after a transport error is safe."""
+    if isinstance(exc, ValueError) or _activity_update_unsupported(exc, status):
+        return None
+    if status is not None and status not in (412, 429) and status < 500:
+        return None
+    if retry_after is not None:
+        if retry_after > _FINAL_EDIT_RETRY_AFTER_CAP_SECS:
+            return None
+        base = retry_after
+    else:
+        base = min(_FINAL_EDIT_BACKOFF_MAX_SECS, 2.0 ** (attempt - 1))
+    return base + random.uniform(0.0, 0.5)
 
 
 def _reaction_to_emoji(reaction_type: Optional[str]) -> str:
@@ -691,6 +735,9 @@ class TeamsAdapter(BasePlatformAdapter):
     # Edit-based streaming (send then conversations.activities.update). Not Slack-style
     # native stream-is-the-message; do not flip this without a distinct Teams stream object.
     draft_stream_is_message = False
+    # Gateway edit-pacing floors (per instance from ``extra``, see ``__init__``).
+    MIN_PROGRESS_EDIT_INTERVAL = _PROGRESS_EDIT_INTERVAL_SECS
+    MIN_STREAM_EDIT_INTERVAL = _STREAM_EDIT_INTERVAL_SECS
     # Processing-lifecycle reactions (👀 while working, ✅/❌ on complete). Unicode maps to
     # Teams reaction ids in _REACTION_TYPE_BY_ALIAS.
     _ACK_EMOJI = "👀"
@@ -732,6 +779,13 @@ class TeamsAdapter(BasePlatformAdapter):
         # (chat_id, activity_id) → last edited text / saturated mid-stream preview.
         self._last_edit_text: Dict[tuple, str] = {}
         self._last_overflow_preview: Dict[tuple, str] = {}
+        self.MIN_PROGRESS_EDIT_INTERVAL = _edit_interval_setting(
+            self._extra, "progress_edit_interval", _PROGRESS_EDIT_INTERVAL_SECS, _PROGRESS_EDIT_INTERVAL_MIN_SECS)
+        self.MIN_STREAM_EDIT_INTERVAL = _edit_interval_setting(
+            self._extra, "stream_edit_interval", _STREAM_EDIT_INTERVAL_SECS, _STREAM_EDIT_INTERVAL_MIN_SECS)
+        # Per-conversation outbound budget shared by typing, sends, cards/media and edits: typing
+        # and interim edits are dropped when busy; sends and final edits wait (bounded), never drop.
+        self._rate_budget = ConversationRateBudget()
 
     @staticmethod
     def _parse_require_mention(config) -> bool:
@@ -1232,6 +1286,7 @@ class TeamsAdapter(BasePlatformAdapter):
     async def _send_via_conv_ref(self, chat_id: str, activity: Any, fallback: Any) -> Any:
         """Send ``activity`` through the cached ConversationReference, else ``App.send(fallback)``."""
         conv_ref = self._conv_ref_for(chat_id)
+        await self._rate_budget.acquire(chat_id)  # cards / media are essential: wait, never drop
         if conv_ref:
             result = await self._app.activity_sender.send(activity, conv_ref)
         else:
@@ -1345,6 +1400,7 @@ class TeamsAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Teams app not initialized")
         last_message_id = None
         for chunk in self.truncate_message(self.format_message(content)):
+            await self._rate_budget.acquire(chat_id)  # every chunk is essential: wait, never drop
             try:
                 if reply_to and reply_to.isdigit() and reply_to != "0":
                     try:
@@ -1358,7 +1414,11 @@ class TeamsAdapter(BasePlatformAdapter):
                 last_message_id = getattr(result, "id", None)
                 self._remember_sent(result)
             except Exception as e:
-                return SendResult(success=False, error=str(e), retryable=True)
+                retry_after = None
+                if _http_status_from_exc(e) == 429:
+                    retry_after = _retry_after_seconds(e)
+                    self._rate_budget.note_throttled(chat_id, retry_after)
+                return SendResult(success=False, error=str(e), retryable=True, retry_after=retry_after)
         return SendResult(success=True, message_id=last_message_id)
 
     async def edit_message(
@@ -1367,9 +1427,14 @@ class TeamsAdapter(BasePlatformAdapter):
         """Progressively update a bot activity (gateway send-then-edit streaming).
 
         Mid-stream (``finalize=False``) truncates oversize text in place so the
-        edit target stays this activity. Identical payloads are skipped. HTTP 429
-        with a short Retry-After is waited inline; a longer wait or 404/405
-        returns ``success=False`` so the stream consumer falls back to a plain send.
+        edit target stays this activity. Identical payloads are skipped. A mid-stream
+        edit makes one attempt (the consumer's next tick carries newer text) and is
+        dropped — ``raw_response={"skipped": True}`` — when the conversation's rate
+        budget is running low. The
+        final edit (``finalize=True``) is always sent, even when unchanged, and
+        transient failures are retried (``_final_edit_retry_delay``). A long
+        Retry-After or 404/405 returns ``success=False`` so the stream consumer
+        falls back to a plain send.
         ``draft_stream_is_message`` stays False: Teams has no native stream object.
         """
         if not self._app:
@@ -1391,11 +1456,29 @@ class TeamsAdapter(BasePlatformAdapter):
             self._last_overflow_preview.pop(key, None)
         if not finalize and self._last_edit_text.get(key) == formatted:
             return SendResult(success=True, message_id=str(message_id))
-        try:
-            await self._update_activity(str(chat_id), str(message_id), formatted)
-        except Exception as e:
-            return await self._on_edit_activity_error(
-                e, chat_id=str(chat_id), message_id=str(message_id), text=formatted)
+        if not finalize and not self._rate_budget.allows(str(chat_id), "edit"):
+            logger.debug("[teams] skipping interim edit for %s (conversation rate budget)", chat_id)
+            return SendResult(success=True, message_id=str(message_id), raw_response={"skipped": True})
+        attempts = _FINAL_EDIT_ATTEMPTS if finalize else 1
+        for attempt in range(1, attempts + 1):
+            if finalize:
+                await self._rate_budget.acquire(str(chat_id))
+            else:
+                self._rate_budget.record(str(chat_id))
+            try:
+                await self._update_activity(str(chat_id), str(message_id), formatted)
+                break
+            except Exception as e:
+                status, retry_after = _http_status_from_exc(e), _retry_after_seconds(e)
+                if status == 429:
+                    self._rate_budget.note_throttled(str(chat_id), retry_after)
+                delay = (_final_edit_retry_delay(e, status, retry_after, attempt)
+                         if attempt < attempts else None)
+                if delay is None:
+                    return self._edit_failure_result(e, status, retry_after)
+                logger.debug("[teams] final edit failed (%s), retry %d/%d in %.1fs",
+                             status or type(e).__name__, attempt, attempts - 1, delay)
+                await asyncio.sleep(delay)
         self._remember_edit_cache(self._last_edit_text, key, formatted)
         return SendResult(success=True, message_id=str(message_id))
 
@@ -1404,27 +1487,14 @@ class TeamsAdapter(BasePlatformAdapter):
             cache.pop(next(iter(cache)))
         cache[key] = text
 
-    async def _on_edit_activity_error(
-        self, exc: BaseException, *, chat_id: str, message_id: str, text: str,
+    @staticmethod
+    def _edit_failure_result(
+        exc: BaseException, status: Optional[int], retry_after: Optional[float],
     ) -> SendResult:
-        """Classify an activity-update failure: short 429 retry, unsupported → fallback send."""
-        status = _http_status_from_exc(exc)
-        retry_after = _retry_after_seconds(exc)
+        """Classify an activity-update failure: rate limit (consumer backs off), unsupported →
+        fallback send, else a plain failure (retryable when transient)."""
         if status == 429 or retry_after is not None:
             wait = float(retry_after) if retry_after is not None else 1.0
-            if wait <= _EDIT_FLOOD_INLINE_WAIT_CAP_SECS:
-                logger.debug("[teams] activity update 429, waiting %.1fs", wait)
-                await asyncio.sleep(wait)
-                try:
-                    await self._update_activity(chat_id, message_id, text)
-                    self._remember_edit_cache(
-                        self._last_edit_text, (chat_id, message_id), text)
-                    return SendResult(success=True, message_id=message_id)
-                except Exception as retry_err:
-                    logger.warning("[teams] activity update retry failed: %s", retry_err)
-                    return SendResult(
-                        success=False, error=str(retry_err), retryable=True,
-                        error_kind="rate_limited")
             return SendResult(
                 success=False, error=str(exc), retryable=True, retry_after=wait,
                 error_kind="rate_limited")
@@ -1440,7 +1510,9 @@ class TeamsAdapter(BasePlatformAdapter):
             retryable=status is None or status >= 500)
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        if self._app:
+        # Typing is the first thing dropped when the conversation's rate budget runs low.
+        if self._app and self._rate_budget.allows(chat_id, "typing"):
+            self._rate_budget.record(chat_id)
             with suppress(Exception):
                 await self._app.send(chat_id, TypingActivityInput())
 

@@ -13,6 +13,7 @@ import inspect
 import json
 import os
 import queue
+import sys
 import threading
 import time
 from agent.i18n import t
@@ -22,7 +23,7 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
+from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome, edit_interval_floor
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import display_kind_for_event, is_machinery_display_kind
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
@@ -2693,8 +2694,16 @@ class GatewayTurnMixin:
             float(getattr(scfg, "fresh_final_after_seconds", 0.0) or 0.0)
             if source.platform == Platform.TELEGRAM else 0.0
         )
+        # An adapter-declared floor (Teams: sends, edits and typing share one per-conversation
+        # quota) slows edits and switches to interval-only pacing: the buffer_threshold fast path
+        # would otherwise edit on every consumer tick once the preview passes a few dozen chars.
+        _edit_interval, _buffer_threshold = scfg.edit_interval, scfg.buffer_threshold
+        _stream_floor = edit_interval_floor(adapter, "MIN_STREAM_EDIT_INTERVAL")
+        if _stream_floor > 0:
+            _edit_interval = max(float(_edit_interval or 0.0), _stream_floor)
+            _buffer_threshold = sys.maxsize
         _consumer_cfg = StreamConsumerConfig(
-            edit_interval=scfg.edit_interval, buffer_threshold=scfg.buffer_threshold,
+            edit_interval=_edit_interval, buffer_threshold=_buffer_threshold,
             cursor=_effective_cursor, buffer_only=_buffer_only,
             fresh_final_after_seconds=_fresh_final_secs, transport=scfg.transport or "edit",
             chat_type=getattr(source, "chat_type", "") or "",

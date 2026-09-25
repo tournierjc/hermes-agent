@@ -195,6 +195,8 @@ platforms:
       port: 3978
       reactions: true        # processing-status 👀/✅/❌; send_message react is always on
       observe_unmentioned: true  # RSC + require_mention: store non-@ chatter as context
+      stream_edit_interval: 2.5    # seconds between streamed-answer edits (min 1.5)
+      progress_edit_interval: 5    # seconds between tool-progress bubble edits (min 2)
     require_mention: false   # true once the app has RSC message-read consent
 ```
 
@@ -301,9 +303,32 @@ display:
       streaming: true   # or false to keep whole-message replies
 ```
 
-If an activity update is rejected (405 / 404 / not supported), Hermes falls back to a single non-streaming send for the rest of that turn — you will not get a flood of partial messages. Identical mid-stream payloads are skipped, and a short `Retry-After` on HTTP 429 is waited inline; a longer rate-limit disables further edits for that turn.
+#### Edit cadence
 
-Typing indicators (`send_typing`) still fire while the agent works. Processing reactions (👀 / ✅ / ❌) are independent of streaming.
+Bot Framework counts every typing indicator, message and activity update against one per-bot, per-conversation quota, so Teams edits more slowly than the gateway defaults:
+
+| Setting (`platforms.teams.extra`) | Default | Minimum | Applies to |
+|---|---|---|---|
+| `stream_edit_interval` | `2.5` s | `1.5` s | the streamed answer |
+| `progress_edit_interval` | `5` s | `2` s | the tool-progress bubble |
+
+The streamed answer is paced by time only (the `streaming.buffer_threshold` size trigger does not apply on Teams); a slower global `streaming.edit_interval` still wins. Other platforms are unaffected.
+
+The completed reply is always written with a final full-text edit (`finalize=True`), even when the last mid-stream edit already showed the same text. Transient failures of that edit (HTTP 429, 412, 5xx, network errors) are retried up to three times, honouring `Retry-After` (up to 10 s) or backing off exponentially with jitter. Mid-stream edits make a single attempt — the next edit carries newer text anyway.
+
+If an activity update is rejected (405 / 404 / not supported), or the final edit still fails, Hermes falls back to a plain send for the rest of that turn — you will not get a flood of partial messages. Identical mid-stream payloads are skipped.
+
+#### Per-conversation rate budget
+
+Microsoft limits each bot per conversation to 7 activities / 1 s, 8 / 2 s, 60 / 30 s and 1800 / hour ([rate limiting](https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/rate-limit)), and a channel is **one** conversation for all of its threads. Typing indicators, messages, cards, media and edits all count. Hermes keeps one sliding-window budget per conversation and, when it gets busy, gives way in this order:
+
+1. **Typing indicators** are skipped first (above 4 / 1 s, 5 / 2 s, 30 / 30 s or 1000 / hour).
+2. **Intermediate edits** — streaming previews and the tool-progress bubble — are skipped next (above 5 / 1 s, 6 / 2 s, 40 / 30 s or 1350 / hour). The next edit carries the newer text.
+3. **Message sends (every chunk), cards, media and the final edit are never dropped.** They wait for room under 6 / 1 s, 7 / 2 s, 50 / 30 s and 1500 / hour — at most 20 s, then they go anyway.
+
+An HTTP 429 pauses the conversation for `Retry-After` (plus jitter): typing and intermediate edits are skipped and essential calls wait out the pause. A rate-limited send reports its `Retry-After` to the gateway's send retry. The budget is per gateway process; a cron job's out-of-process send is not counted, which is part of what the headroom below Microsoft's limits is for.
+
+Typing indicators (`send_typing`) still fire while the agent works, within the budget above. Processing reactions (👀 / ✅ / ❌) are independent of streaming.
 
 ### Meeting Summary Delivery (Teams Meeting Pipeline)
 
