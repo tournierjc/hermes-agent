@@ -2424,3 +2424,116 @@ class TestTeamsEditCadence:
         for status in (400, 403, 404, 405):
             assert delay(_HTTPError(status), status, None, 1) is None
         assert delay(ValueError("bad id"), None, None, 1) is None
+
+
+class TestTeamsRateBudget:
+    """Per-conversation budget wired into typing / send / cards / edits."""
+
+    CHANNEL = "19:abc@thread.tacv2"
+
+    def _make_adapter(self):
+        from plugins.platforms.teams.rate_budget import ConversationRateBudget
+
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+        ))
+        adapter._app = MagicMock()
+        adapter._app.send = AsyncMock(return_value=MagicMock(id="act-1"))
+        adapter._update_activity = AsyncMock()
+        self.now = 1000.0
+        self.slept = []
+
+        async def _sleep(delay):
+            self.slept.append(delay)
+            self.now += delay
+
+        adapter._rate_budget = ConversationRateBudget(clock=lambda: self.now, sleep=_sleep)
+        return adapter
+
+    def _fill(self, adapter, tier, chat_id=None):
+        """Record activities until ``tier`` would be refused."""
+        chat_id = chat_id or self.CHANNEL
+        while adapter._rate_budget.allows(chat_id, tier):
+            adapter._rate_budget.record(chat_id)
+
+    @pytest.mark.anyio
+    async def test_typing_is_dropped_first_and_thread_ids_share_the_channel(self):
+        adapter = self._make_adapter()
+        self._fill(adapter, "typing", f"{self.CHANNEL};messageid=1")
+        await adapter.send_typing(f"{self.CHANNEL};messageid=2")
+        adapter._app.send.assert_not_awaited()
+        # ...while an intermediate edit still fits.
+        result = await adapter.edit_message(f"{self.CHANNEL};messageid=2", "act-1", "partial")
+        assert result.success is True and not (result.raw_response or {}).get("skipped")
+        adapter._update_activity.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_other_conversations_are_unaffected(self):
+        adapter = self._make_adapter()
+        self._fill(adapter, "typing")
+        await adapter.send_typing("a:personal-chat")
+        adapter._app.send.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_interim_edit_is_skipped_when_busy(self):
+        adapter = self._make_adapter()
+        self._fill(adapter, "edit")
+        result = await adapter.edit_message(self.CHANNEL, "act-1", "partial", finalize=False)
+        assert result.success is True
+        assert result.raw_response == {"skipped": True}  # stream consumer retries next tick
+        adapter._update_activity.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_final_edit_is_never_dropped_it_waits(self):
+        from plugins.platforms.teams.rate_budget import HARD_LIMITS
+
+        adapter = self._make_adapter()
+        for _ in range(HARD_LIMITS[0][1]):  # essential headroom for this second is used up
+            adapter._rate_budget.record(self.CHANNEL)
+        result = await adapter.edit_message(self.CHANNEL, "act-1", "full answer", finalize=True)
+        assert result.success is True
+        adapter._update_activity.assert_awaited_once()
+        assert self.slept  # waited for room instead of dropping or bursting
+
+    @pytest.mark.anyio
+    async def test_send_chunks_are_never_dropped(self):
+        adapter = self._make_adapter()
+        self._fill(adapter, "edit")
+        for _ in range(10):
+            adapter._rate_budget.record(self.CHANNEL)
+        result = await adapter.send(self.CHANNEL, "the answer")
+        assert result.success is True
+        adapter._app.send.assert_awaited_once()
+        assert self.slept
+
+    @pytest.mark.anyio
+    async def test_cards_and_media_draw_from_the_same_budget(self):
+        adapter = self._make_adapter()
+        adapter._app.activity_sender.send = AsyncMock(return_value=MagicMock(id="card-1"))
+        before = len(adapter._rate_budget._log.get(self.CHANNEL, ()))
+        await adapter._send_via_conv_ref(f"{self.CHANNEL};messageid=5", MagicMock(), MagicMock())
+        assert len(adapter._rate_budget._log[self.CHANNEL]) == before + 1
+
+    @pytest.mark.anyio
+    async def test_send_429_surfaces_retry_after_and_pauses_non_essential(self):
+        adapter = self._make_adapter()
+        adapter._app.send = AsyncMock(side_effect=_HTTPError(429, retry_after=4))
+        result = await adapter.send(self.CHANNEL, "hello")
+        assert result.success is False and result.retryable is True
+        assert result.retry_after == 4.0  # base _send_with_retry honours it
+        adapter._app.send = AsyncMock()
+        await adapter.send_typing(self.CHANNEL)
+        adapter._app.send.assert_not_awaited()
+        self.now += 5.0
+        await adapter.send_typing(self.CHANNEL)
+        adapter._app.send.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_interim_429_pauses_later_interim_edits(self):
+        adapter = self._make_adapter()
+        adapter._update_activity = AsyncMock(side_effect=[_HTTPError(429, retry_after=3), None])
+        first = await adapter.edit_message(self.CHANNEL, "act-1", "part 1")
+        assert first.success is False and first.error_kind == "rate_limited"
+        second = await adapter.edit_message(self.CHANNEL, "act-1", "part 2")
+        assert second.raw_response == {"skipped": True}
+        assert adapter._update_activity.await_count == 1

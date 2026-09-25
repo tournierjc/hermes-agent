@@ -70,6 +70,7 @@ from gateway.platforms._shared import (
     coerce_port, extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
     seed_extra_from_env as _seed_extra_from_env, send_error
 )
+from plugins.platforms.teams.rate_budget import ConversationRateBudget
 
 logger = logging.getLogger(__name__)
 
@@ -782,6 +783,9 @@ class TeamsAdapter(BasePlatformAdapter):
             self._extra, "progress_edit_interval", _PROGRESS_EDIT_INTERVAL_SECS, _PROGRESS_EDIT_INTERVAL_MIN_SECS)
         self.MIN_STREAM_EDIT_INTERVAL = _edit_interval_setting(
             self._extra, "stream_edit_interval", _STREAM_EDIT_INTERVAL_SECS, _STREAM_EDIT_INTERVAL_MIN_SECS)
+        # Per-conversation outbound budget shared by typing, sends, cards/media and edits: typing
+        # and interim edits are dropped when busy; sends and final edits wait (bounded), never drop.
+        self._rate_budget = ConversationRateBudget()
 
     @staticmethod
     def _parse_require_mention(config) -> bool:
@@ -1282,6 +1286,7 @@ class TeamsAdapter(BasePlatformAdapter):
     async def _send_via_conv_ref(self, chat_id: str, activity: Any, fallback: Any) -> Any:
         """Send ``activity`` through the cached ConversationReference, else ``App.send(fallback)``."""
         conv_ref = self._conv_ref_for(chat_id)
+        await self._rate_budget.acquire(chat_id)  # cards / media are essential: wait, never drop
         if conv_ref:
             result = await self._app.activity_sender.send(activity, conv_ref)
         else:
@@ -1395,6 +1400,7 @@ class TeamsAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Teams app not initialized")
         last_message_id = None
         for chunk in self.truncate_message(self.format_message(content)):
+            await self._rate_budget.acquire(chat_id)  # every chunk is essential: wait, never drop
             try:
                 if reply_to and reply_to.isdigit() and reply_to != "0":
                     try:
@@ -1408,7 +1414,11 @@ class TeamsAdapter(BasePlatformAdapter):
                 last_message_id = getattr(result, "id", None)
                 self._remember_sent(result)
             except Exception as e:
-                return SendResult(success=False, error=str(e), retryable=True)
+                retry_after = None
+                if _http_status_from_exc(e) == 429:
+                    retry_after = _retry_after_seconds(e)
+                    self._rate_budget.note_throttled(chat_id, retry_after)
+                return SendResult(success=False, error=str(e), retryable=True, retry_after=retry_after)
         return SendResult(success=True, message_id=last_message_id)
 
     async def edit_message(
@@ -1418,7 +1428,9 @@ class TeamsAdapter(BasePlatformAdapter):
 
         Mid-stream (``finalize=False``) truncates oversize text in place so the
         edit target stays this activity. Identical payloads are skipped. A mid-stream
-        edit makes one attempt (the consumer's next tick carries newer text). The
+        edit makes one attempt (the consumer's next tick carries newer text) and is
+        dropped — ``raw_response={"skipped": True}`` — when the conversation's rate
+        budget is running low. The
         final edit (``finalize=True``) is always sent, even when unchanged, and
         transient failures are retried (``_final_edit_retry_delay``). A long
         Retry-After or 404/405 returns ``success=False`` so the stream consumer
@@ -1444,13 +1456,22 @@ class TeamsAdapter(BasePlatformAdapter):
             self._last_overflow_preview.pop(key, None)
         if not finalize and self._last_edit_text.get(key) == formatted:
             return SendResult(success=True, message_id=str(message_id))
+        if not finalize and not self._rate_budget.allows(str(chat_id), "edit"):
+            logger.debug("[teams] skipping interim edit for %s (conversation rate budget)", chat_id)
+            return SendResult(success=True, message_id=str(message_id), raw_response={"skipped": True})
         attempts = _FINAL_EDIT_ATTEMPTS if finalize else 1
         for attempt in range(1, attempts + 1):
+            if finalize:
+                await self._rate_budget.acquire(str(chat_id))
+            else:
+                self._rate_budget.record(str(chat_id))
             try:
                 await self._update_activity(str(chat_id), str(message_id), formatted)
                 break
             except Exception as e:
                 status, retry_after = _http_status_from_exc(e), _retry_after_seconds(e)
+                if status == 429:
+                    self._rate_budget.note_throttled(str(chat_id), retry_after)
                 delay = (_final_edit_retry_delay(e, status, retry_after, attempt)
                          if attempt < attempts else None)
                 if delay is None:
@@ -1489,7 +1510,9 @@ class TeamsAdapter(BasePlatformAdapter):
             retryable=status is None or status >= 500)
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        if self._app:
+        # Typing is the first thing dropped when the conversation's rate budget runs low.
+        if self._app and self._rate_budget.allows(chat_id, "typing"):
+            self._rate_budget.record(chat_id)
             with suppress(Exception):
                 await self._app.send(chat_id, TypingActivityInput())
 

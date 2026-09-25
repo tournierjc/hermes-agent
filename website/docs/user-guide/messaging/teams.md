@@ -318,7 +318,17 @@ The completed reply is always written with a final full-text edit (`finalize=Tru
 
 If an activity update is rejected (405 / 404 / not supported), or the final edit still fails, Hermes falls back to a plain send for the rest of that turn — you will not get a flood of partial messages. Identical mid-stream payloads are skipped.
 
-Typing indicators (`send_typing`) still fire while the agent works. Processing reactions (👀 / ✅ / ❌) are independent of streaming.
+#### Per-conversation rate budget
+
+Microsoft limits each bot per conversation to 7 activities / 1 s, 8 / 2 s, 60 / 30 s and 1800 / hour ([rate limiting](https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/rate-limit)), and a channel is **one** conversation for all of its threads. Typing indicators, messages, cards, media and edits all count. Hermes keeps one sliding-window budget per conversation and, when it gets busy, gives way in this order:
+
+1. **Typing indicators** are skipped first (above 4 / 1 s, 5 / 2 s, 30 / 30 s or 1000 / hour).
+2. **Intermediate edits** — streaming previews and the tool-progress bubble — are skipped next (above 5 / 1 s, 6 / 2 s, 40 / 30 s or 1350 / hour). The next edit carries the newer text.
+3. **Message sends (every chunk), cards, media and the final edit are never dropped.** They wait for room under 6 / 1 s, 7 / 2 s, 50 / 30 s and 1500 / hour — at most 20 s, then they go anyway.
+
+An HTTP 429 pauses the conversation for `Retry-After` (plus jitter): typing and intermediate edits are skipped and essential calls wait out the pause. A rate-limited send reports its `Retry-After` to the gateway's send retry. The budget is per gateway process; a cron job's out-of-process send is not counted, which is part of what the headroom below Microsoft's limits is for.
+
+Typing indicators (`send_typing`) still fire while the agent works, within the budget above. Processing reactions (👀 / ✅ / ❌) are independent of streaming.
 
 ### Meeting Summary Delivery (Teams Meeting Pipeline)
 
