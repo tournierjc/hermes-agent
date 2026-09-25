@@ -2252,7 +2252,7 @@ class TestTeamsStreaming:
             response = SimpleNamespace(headers={"Retry-After": "0"})
 
         adapter._update_activity = AsyncMock(side_effect=[_RateLimit("slow down"), None])
-        result = await adapter.edit_message("19:abc@thread.v2", "act-1", "Hello")
+        result = await adapter.edit_message("19:abc@thread.v2", "act-1", "Hello", finalize=True)
         assert result.success is True
         assert adapter._update_activity.await_count == 2
 
@@ -2296,3 +2296,131 @@ class TestTeamsStreaming:
         delete.assert_awaited_once_with("consent-card-1")
         adapter._upload_consented_file.assert_awaited_once()
 
+
+
+class _HTTPError(Exception):
+    """SDK/httpx-shaped failure: ``status_code`` + optional ``Retry-After``."""
+
+    def __init__(self, status, retry_after=None):
+        super().__init__(f"HTTP {status}")
+        self.status_code = status
+        headers = {"Retry-After": str(retry_after)} if retry_after is not None else {}
+        self.response = SimpleNamespace(headers=headers)
+
+
+class TestTeamsEditCadence:
+    """Teams-specific edit pacing (read by the gateway) + the guaranteed final edit."""
+
+    def _make_adapter(self, **extra):
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="secret", tenant_id="tenant", **extra,
+        ))
+        adapter._app = MagicMock()
+        adapter._app.send = AsyncMock(return_value=MagicMock(id="act-1"))
+        return adapter
+
+    def test_default_cadence_is_slower_than_gateway_defaults(self):
+        from gateway.config import DEFAULT_STREAMING_EDIT_INTERVAL
+        from gateway.platforms.base import edit_interval_floor
+
+        adapter = self._make_adapter()
+        progress = edit_interval_floor(adapter, "MIN_PROGRESS_EDIT_INTERVAL")
+        stream = edit_interval_floor(adapter, "MIN_STREAM_EDIT_INTERVAL")
+        assert progress > 1.5  # gateway tool-progress default
+        assert stream > DEFAULT_STREAMING_EDIT_INTERVAL
+        assert progress > stream  # the answer refreshes faster than the progress bubble
+
+    def test_cadence_is_configurable_via_extra(self):
+        adapter = self._make_adapter(progress_edit_interval=8, stream_edit_interval="4.5")
+        assert adapter.MIN_PROGRESS_EDIT_INTERVAL == 8.0
+        assert adapter.MIN_STREAM_EDIT_INTERVAL == 4.5
+        assert TeamsAdapter.MIN_STREAM_EDIT_INTERVAL != 4.5  # per instance, not the class
+
+    def test_cadence_is_clamped_and_invalid_values_fall_back(self):
+        fast = self._make_adapter(progress_edit_interval=0.1, stream_edit_interval=0.2)
+        assert fast.MIN_PROGRESS_EDIT_INTERVAL == _teams_mod._PROGRESS_EDIT_INTERVAL_MIN_SECS
+        assert fast.MIN_STREAM_EDIT_INTERVAL == _teams_mod._STREAM_EDIT_INTERVAL_MIN_SECS
+        default = self._make_adapter()
+        for bogus in ("abc", -1, 0, True):
+            adapter = self._make_adapter(progress_edit_interval=bogus, stream_edit_interval=bogus)
+            assert adapter.MIN_PROGRESS_EDIT_INTERVAL == default.MIN_PROGRESS_EDIT_INTERVAL
+            assert adapter.MIN_STREAM_EDIT_INTERVAL == default.MIN_STREAM_EDIT_INTERVAL
+
+    def test_stream_consumer_config_uses_teams_cadence(self):
+        from gateway.config import StreamingConfig
+        from gateway.run_turn import GatewayTurnMixin
+        from gateway.session import SessionSource
+
+        adapter = self._make_adapter()
+        source = SessionSource(platform=adapter.platform, chat_id="19:abc@thread.tacv2", chat_type="channel")
+        cfg, _ = GatewayTurnMixin._build_stream_consumer_config(
+            SimpleNamespace(), source, StreamingConfig(), adapter, on_missing_cursor="fallback")
+        assert cfg.edit_interval == adapter.MIN_STREAM_EDIT_INTERVAL
+        assert cfg.buffer_threshold > adapter.MAX_MESSAGE_LENGTH  # size trigger off
+
+    @pytest.mark.anyio
+    async def test_final_edit_is_sent_even_when_text_is_unchanged(self):
+        adapter = self._make_adapter()
+        adapter._update_activity = AsyncMock()
+        await adapter.edit_message("19:abc@thread.v2", "act-1", "done", finalize=False)
+        await adapter.edit_message("19:abc@thread.v2", "act-1", "done", finalize=True)
+        assert adapter._update_activity.await_count == 2
+
+    @pytest.mark.anyio
+    async def test_final_edit_retries_transient_failures(self, monkeypatch):
+        monkeypatch.setattr(_teams_mod, "_final_edit_retry_delay", lambda *a: 0.0)
+        adapter = self._make_adapter()
+        adapter._update_activity = AsyncMock(side_effect=[_HTTPError(503), OSError("reset"), None])
+        result = await adapter.edit_message("19:abc@thread.v2", "act-1", "full answer", finalize=True)
+        assert result.success is True
+        assert adapter._update_activity.await_count == 3
+        assert {c.args[2] for c in adapter._update_activity.await_args_list} == {"full answer"}
+
+    @pytest.mark.anyio
+    async def test_final_edit_gives_up_after_bounded_attempts(self, monkeypatch):
+        monkeypatch.setattr(_teams_mod, "_final_edit_retry_delay", lambda *a: 0.0)
+        adapter = self._make_adapter()
+        adapter._update_activity = AsyncMock(side_effect=_HTTPError(502))
+        result = await adapter.edit_message("19:abc@thread.v2", "act-1", "full answer", finalize=True)
+        assert result.success is False and result.retryable is True
+        assert adapter._update_activity.await_count == _teams_mod._FINAL_EDIT_ATTEMPTS
+
+    @pytest.mark.anyio
+    async def test_final_edit_does_not_retry_permanent_errors(self):
+        adapter = self._make_adapter()
+        adapter._update_activity = AsyncMock(side_effect=_HTTPError(403))
+        result = await adapter.edit_message("19:abc@thread.v2", "act-1", "full answer", finalize=True)
+        assert result.success is False
+        adapter._update_activity.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_final_edit_long_retry_after_hands_off_to_fallback_send(self):
+        adapter = self._make_adapter()
+        long_wait = _teams_mod._FINAL_EDIT_RETRY_AFTER_CAP_SECS + 5
+        adapter._update_activity = AsyncMock(side_effect=_HTTPError(429, retry_after=long_wait))
+        result = await adapter.edit_message("19:abc@thread.v2", "act-1", "full answer", finalize=True)
+        assert result.success is False
+        assert result.error_kind == "rate_limited" and result.retry_after == long_wait
+        adapter._update_activity.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_midstream_429_is_not_retried_inline(self):
+        adapter = self._make_adapter()
+        adapter._update_activity = AsyncMock(side_effect=_HTTPError(429, retry_after=0))
+        result = await adapter.edit_message("19:abc@thread.v2", "act-1", "partial", finalize=False)
+        assert result.success is False and result.error_kind == "rate_limited"
+        adapter._update_activity.assert_awaited_once()  # the consumer's next tick carries newer text
+
+    def test_final_edit_retry_delay_policy(self, monkeypatch):
+        monkeypatch.setattr(_teams_mod.random, "uniform", lambda a, b: 0.0)
+        delay = _teams_mod._final_edit_retry_delay
+        cap = _teams_mod._FINAL_EDIT_RETRY_AFTER_CAP_SECS
+        assert delay(_HTTPError(429), 429, 3.0, 1) == 3.0  # server's Retry-After wins
+        assert delay(_HTTPError(429), 429, cap + 1, 1) is None
+        assert delay(_HTTPError(503), 503, None, 1) < delay(_HTTPError(503), 503, None, 2)
+        assert delay(_HTTPError(503), 503, None, 50) == _teams_mod._FINAL_EDIT_BACKOFF_MAX_SECS
+        assert delay(_HTTPError(412), 412, None, 1) is not None
+        assert delay(OSError("reset"), None, None, 1) is not None
+        for status in (400, 403, 404, 405):
+            assert delay(_HTTPError(status), status, None, 1) is None
+        assert delay(ValueError("bad id"), None, None, 1) is None

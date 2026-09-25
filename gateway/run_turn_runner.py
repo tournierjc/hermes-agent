@@ -23,7 +23,7 @@ from agent.interrupt_compat import _accepts_keyword
 from agent.replay_cleanup import canonicalize_replay_history
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, edit_interval_floor
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -719,7 +719,9 @@ class TurnRunner:
             return
         st = self._progress_edit_state(adapter)
         last_edit_ts = 0.0
-        EDIT_INTERVAL = 1.5  # Minimum seconds between edits (Telegram flood control)
+        # Minimum seconds between edits (Telegram flood control); an adapter may declare a slower
+        # floor (Teams: sends, edits and typing share one per-conversation quota).
+        EDIT_INTERVAL = max(1.5, edit_interval_floor(adapter, "MIN_PROGRESS_EDIT_INTERVAL"))
         while True:
             try:
                 if not ctx._run_still_current():

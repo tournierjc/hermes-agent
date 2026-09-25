@@ -215,6 +215,16 @@ def build_auto_tts_output_path(platform) -> str:
     return audio_path
 
 
+def edit_interval_floor(adapter: object, attr: str) -> float:
+    """Adapter edit-pacing floor (``MIN_PROGRESS_EDIT_INTERVAL`` / ``MIN_STREAM_EDIT_INTERVAL``) in
+    seconds; 0.0 when unset. Only real positive numbers count, so duck-typed adapters and MagicMock
+    test doubles keep the gateway defaults."""
+    value = getattr(adapter, attr, None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return 0.0
+    return max(0.0, float(value))
+
+
 def utf16_len(s: str) -> int:
     """UTF-16 code units in *s* — Telegram's 4 096 limit counts those, so astral chars
     (emoji, CJK Ext B) cost **two** units although Python's ``len()`` counts one.
@@ -2668,6 +2678,12 @@ class BasePlatformAdapter(ABC):
 
     # Surfaces needing an explicit finalize edit (DingTalk AI Cards): the consumer never skips it.
     REQUIRES_EDIT_FINALIZE: bool = False
+    # Floors (seconds) for gateway-driven edit pacing; 0 keeps the gateway defaults (tool-progress
+    # bubble 1.5s; stream consumer ``streaming.edit_interval`` + ``buffer_threshold``). Platforms that
+    # meter sends, edits and typing against one per-conversation quota (Teams) raise them; a positive
+    # stream floor also makes the consumer pace by interval only. Read via ``edit_interval_floor``.
+    MIN_PROGRESS_EDIT_INTERVAL: float = 0.0
+    MIN_STREAM_EDIT_INTERVAL: float = 0.0
 
     async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
         """Create a fresh thread under ``parent_chat_id`` for a CLI→platform session handoff; its id

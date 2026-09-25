@@ -195,6 +195,8 @@ platforms:
       port: 3978
       reactions: true        # processing-status 👀/✅/❌; send_message react is always on
       observe_unmentioned: true  # RSC + require_mention: store non-@ chatter as context
+      stream_edit_interval: 2.5    # seconds between streamed-answer edits (min 1.5)
+      progress_edit_interval: 5    # seconds between tool-progress bubble edits (min 2)
     require_mention: false   # true once the app has RSC message-read consent
 ```
 
@@ -301,7 +303,20 @@ display:
       streaming: true   # or false to keep whole-message replies
 ```
 
-If an activity update is rejected (405 / 404 / not supported), Hermes falls back to a single non-streaming send for the rest of that turn — you will not get a flood of partial messages. Identical mid-stream payloads are skipped, and a short `Retry-After` on HTTP 429 is waited inline; a longer rate-limit disables further edits for that turn.
+#### Edit cadence
+
+Bot Framework counts every typing indicator, message and activity update against one per-bot, per-conversation quota, so Teams edits more slowly than the gateway defaults:
+
+| Setting (`platforms.teams.extra`) | Default | Minimum | Applies to |
+|---|---|---|---|
+| `stream_edit_interval` | `2.5` s | `1.5` s | the streamed answer |
+| `progress_edit_interval` | `5` s | `2` s | the tool-progress bubble |
+
+The streamed answer is paced by time only (the `streaming.buffer_threshold` size trigger does not apply on Teams); a slower global `streaming.edit_interval` still wins. Other platforms are unaffected.
+
+The completed reply is always written with a final full-text edit (`finalize=True`), even when the last mid-stream edit already showed the same text. Transient failures of that edit (HTTP 429, 412, 5xx, network errors) are retried up to three times, honouring `Retry-After` (up to 10 s) or backing off exponentially with jitter. Mid-stream edits make a single attempt — the next edit carries newer text anyway.
+
+If an activity update is rejected (405 / 404 / not supported), or the final edit still fails, Hermes falls back to a plain send for the rest of that turn — you will not get a flood of partial messages. Identical mid-stream payloads are skipped.
 
 Typing indicators (`send_typing`) still fire while the agent works. Processing reactions (👀 / ✅ / ❌) are independent of streaming.
 
