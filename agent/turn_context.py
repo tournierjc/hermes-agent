@@ -646,8 +646,8 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     agent._run_budget_started_at = (
         time.time() if getattr(agent, "run_budget_seconds", None) else None
     )
-    # Reset the streaming context / think scrubbers at the top of each turn.
-    for name in ("_stream_context_scrubber", "_stream_think_scrubber"):
+    # Reset the streaming context / think / tool-call scrubbers at the top of each turn.
+    for name in ("_stream_context_scrubber", "_stream_think_scrubber", "_stream_tool_call_scrubber"):
         scrubber = getattr(agent, name, None)
         if scrubber is not None:
             scrubber.reset()

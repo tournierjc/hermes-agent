@@ -75,6 +75,10 @@ class StreamDeliveryMixin:
         if think_scrubber is not None:
             think_tail = think_scrubber.flush()
             deliver(ctx_scrubber.feed(think_tail) if think_tail and ctx_scrubber is not None else think_tail)
+        tool_call_scrubber = getattr(self, "_stream_tool_call_scrubber", None)
+        if tool_call_scrubber is not None:
+            tool_tail = tool_call_scrubber.flush()
+            deliver(ctx_scrubber.feed(tool_tail) if tool_tail and ctx_scrubber is not None else tool_tail)
         if ctx_scrubber is not None:
             deliver(ctx_scrubber.flush())
         self._current_streamed_assistant_text = ""
@@ -316,6 +320,11 @@ class StreamDeliveryMixin:
             # See #5719.
             scrubber = getattr(self, "_stream_context_scrubber", None)
             text = think_scrubber.feed(text) if think_scrubber is not None else self._strip_think_blocks(text)
+            # Tool-call markup a server shipped as content is call scaffolding, not an answer: the
+            # user must not watch the raw call scroll past (the call itself is recovered in intake).
+            tool_call_scrubber = getattr(self, "_stream_tool_call_scrubber", None)
+            if tool_call_scrubber is not None:
+                text = tool_call_scrubber.feed(text)
             # Providers that inline reasoning (MiniMax-M3 <think>…</think>) send no reasoning delta, so the
             # live reasoning pane would stay empty; forward what the scrubber stripped instead (#89647).
             hidden = think_scrubber.last_hidden if think_scrubber is not None else ""

@@ -62,6 +62,27 @@ class TestToolCallStripping:
             assert out.strip() == "Waiting."
 
 
+    @pytest.mark.parametrize("stripper", _STRIPPERS)
+    def test_bare_function_equals_block_stripped(self, stripper):
+        """A call shipped without its ``<tool_call>`` envelope (Qwen/Unsloth form) used to keep the
+        whole block in the delivered answer — the stray-closer pattern removed only ``</function>``.
+        """
+        text = (
+            "Checking the render.\n"
+            "<function=process_manage>\n"
+            "<parameter=action>\nwait\n</parameter>\n"
+            "<parameter=session_id>\nproc_d755c36c5ade\n</parameter>\n"
+            "</function>"
+        )
+        assert stripper(text).strip() == "Checking the render."
+
+    @pytest.mark.parametrize("stripper", _STRIPPERS)
+    def test_prose_mentioning_an_equals_form_function_tag_survives(self, stripper):
+        """No closing tag means prose, not a block (the pattern needs the pair)."""
+        text = "Compare a<function=b> against <function=c> in that grammar."
+
+        assert stripper(text) == text
+
     def test_empty_string(self):
         assert _strip_reasoning_tags("") == ""
 

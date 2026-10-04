@@ -34,6 +34,7 @@ from agent.model_metadata import (
 from agent.process_bootstrap import _install_safe_stdio
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.think_scrubber import StreamingThinkScrubber
+from agent.tool_call_scrubber import StreamingToolCallScrubber
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig, ToolCallGuardrailController
 )
@@ -642,6 +643,10 @@ _STREAM_STATE: Dict[str, Any] = {
     # per-delta regexes (both tags must be in one string).
     "_stream_context_scrubber": StreamingContextScrubber,
     "_stream_think_scrubber": StreamingThinkScrubber,
+    # Hides tool-call markup a server shipped as content (a call for a tool the request did not
+    # offer) so the live stream never shows the raw call; the call itself is recovered in intake
+    # (agent/markup_tool_calls.py).
+    "_stream_tool_call_scrubber": StreamingToolCallScrubber,
     "_current_streamed_assistant_text": "",  # so a later completed interim isn't re-sent
     "_delivered_interim_texts": set,  # interims this user turn (spans Codex continuations)
     # Single-writer guard for the delta sink: each attempt claims a monotonic writer token and

@@ -61,6 +61,11 @@ def _strip_reasoning_tags(text: str) -> str:
         r'(?:(?<=^)|(?<=[\n\r.!?:]))[ \t]*<function\b[^>]*\bname\s*=[^>]*>(?:(?:(?!</function>).)*)</function>\s*',
         '', cleaned, flags=re.DOTALL | re.IGNORECASE,
     )
+    # <function=NAME>…</function> (Qwen/Unsloth): a bare "<function=" is never prose, so no gate.
+    cleaned = re.sub(
+        r'<function\s*=\s*[\w.:-]+\s*>(?:(?:(?!</function>).)*)</function>\s*',
+        '', cleaned, flags=re.DOTALL | re.IGNORECASE,
+    )
     # Stray closers and cut tool-call fragments share storage's compiled patterns (#101899, #102303).
     from agent.agent_runtime_helpers import _STRAY_TOOL_CALL_CLOSER_PATTERN, _UNTERMINATED_TOOL_CALL_PATTERN
     cleaned = _STRAY_TOOL_CALL_CLOSER_PATTERN.sub('', cleaned)

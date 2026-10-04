@@ -55,6 +55,12 @@ _NAMED_FUNCTION_BLOCK_PATTERN = re.compile(
     r'<function\b[^>]*\bname\s*=[^>]*>'
     r'(?:(?:(?!</function>).)*)</function>', re.DOTALL | re.IGNORECASE,
 )
+# The Qwen/Unsloth ``<function=NAME>…</function>`` block. A bare ``<function=`` is never prose, so
+# no boundary gate; without this pattern a call shipped *without* its ``<tool_call>`` envelope kept
+# the whole block in the final answer (the stray-closer pattern removed only ``</function>``).
+_FUNCTION_EQUALS_BLOCK_PATTERN = re.compile(
+    r'<function\s*=\s*[\w.:-]+\s*>(?:(?:(?!</function>).)*)</function>', re.DOTALL | re.IGNORECASE,
+)
 _UNTERMINATED_REASONING_BLOCK_PATTERN = re.compile(
     rf'(?:^|\n)[ \t]*<(?:{"|".join(THINK_TAG_NAMES)})\b[^>]*>.*$', re.DOTALL | re.IGNORECASE
 )
@@ -838,6 +844,7 @@ def _flatten_content_text(content: Any) -> str:
 # be valuable, matching OpenClaw's asymmetry).
 _THINK_STRIP_PATTERNS = (
     *_REASONING_BLOCK_PATTERNS, *_TOOL_CALL_BLOCK_PATTERNS, _NAMED_FUNCTION_BLOCK_PATTERN,
+    _FUNCTION_EQUALS_BLOCK_PATTERN,
     _UNTERMINATED_REASONING_BLOCK_PATTERN, _ORPHAN_REASONING_TAG_PATTERN,
     _STRAY_TOOL_CALL_CLOSER_PATTERN, _UNTERMINATED_TOOL_CALL_PATTERN,
 )
