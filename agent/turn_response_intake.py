@@ -12,6 +12,7 @@ import logging
 import re
 from typing import Any, Dict, Optional
 
+from agent.markup_tool_calls import recover_markup_tool_calls
 from agent.provider_projection import splice_provider_projection
 from agent.trajectory import has_incomplete_scratchpad
 from agent.turn_truncation import (
@@ -135,6 +136,18 @@ def normalize_model_response(
 
     if assistant_message.content is not None and not isinstance(assistant_message.content, str):
         assistant_message.content = _coerce_content_text(assistant_message.content)
+
+    # A call the server shipped as markup rather than as ``tool_calls`` — its name was not offered
+    # in this request (a deferred tool, a folded-out MCP tool) — is an action, not an empty answer.
+    # Rebuild it here, before the loop reads "no tool calls" and ends the turn on stripped-scaffolding
+    # content. Markup beside visible text is left alone: the text is the answer.
+    if assistant_message.content and not getattr(assistant_message, "tool_calls", None):
+        _recovered = recover_markup_tool_calls(
+            assistant_message.content, strip_visible=agent._strip_think_blocks,
+        )
+        if _recovered is not None:
+            assistant_message.tool_calls, _residue = _recovered
+            assistant_message.content = _residue or None
 
     # Agent-as-provider projection: splice the provider-agent's own tool work in as
     # call/result rows before this turn's assistant message; no-op for ordinary providers.
